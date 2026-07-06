@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# build artifacts
+silica
+silicadbd
+zig-out/
+.zig-cache/
+
+# local-only claude settings
+.claude/settings.local.json
