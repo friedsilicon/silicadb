@@ -2,6 +2,7 @@
 # End-to-end smoke test: daemon + client + persistence across restart.
 set -e
 
+BIN=${BIN:-./zig-out/bin}
 DIR=$(mktemp -d)
 export SILICADB_HOME="$DIR"
 PID=""
@@ -12,7 +13,7 @@ cleanup() {
 trap cleanup EXIT
 
 start_daemon() {
-    ./silicadbd &
+    "$BIN"/silicadbd &
     PID=$!
     i=0
     while [ ! -S "$DIR/silicadb.sock" ]; do
@@ -24,22 +25,22 @@ start_daemon() {
 
 start_daemon
 
-./silica ping >/dev/null
+"$BIN"/silica ping >/dev/null
 
-printf '%s' "hello metal" | ./silica put proj/greeting -k note -t demo,smoke
-test "$(./silica get proj/greeting)" = "hello metal"
+printf '%s' "hello metal" | "$BIN"/silica put proj/greeting -k note -t demo,smoke
+test "$("$BIN"/silica get proj/greeting)" = "hello metal"
 
-./silica put proj/other -k fact second value
-test "$(./silica get proj/other)" = "second value"
+"$BIN"/silica put proj/other -k fact second value
+test "$("$BIN"/silica get proj/other)" = "second value"
 
-./silica ls proj/ | grep -q greeting
-./silica link proj/greeting refines proj/other
-./silica links proj/greeting | grep -q refines
-./silica stats | grep -q '^keys: 2$'
-./silica stats | grep -q '^links: 1$'
+"$BIN"/silica ls proj/ | grep -q greeting
+"$BIN"/silica link proj/greeting refines proj/other
+"$BIN"/silica links proj/greeting | grep -q refines
+"$BIN"/silica stats | grep -q '^keys: 2$'
+"$BIN"/silica stats | grep -q '^links: 1$'
 
-./silica rm proj/greeting
-if ./silica get proj/greeting 2>/dev/null; then
+"$BIN"/silica rm proj/greeting
+if "$BIN"/silica get proj/greeting 2>/dev/null; then
     echo "FAIL: expected miss after rm"
     exit 1
 fi
@@ -49,8 +50,8 @@ kill "$PID"
 wait "$PID" 2>/dev/null || true
 start_daemon
 
-test "$(./silica get proj/other)" = "second value"
-./silica links proj/greeting | grep -q refines
-./silica stats | grep -q '^keys: 1$'
+test "$("$BIN"/silica get proj/other)" = "second value"
+"$BIN"/silica links proj/greeting | grep -q refines
+"$BIN"/silica stats | grep -q '^keys: 1$'
 
 echo "SMOKE OK"

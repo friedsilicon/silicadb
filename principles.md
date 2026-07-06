@@ -4,7 +4,7 @@
    No JSON, no serialization frameworks. If a byte doesn't earn its place,
    it goes.
 
-2. **Zero dependencies.** Standard library + POSIX only. A checkout and a C
+2. **Zero dependencies.** Standard library + POSIX only. A checkout and a Zig
    compiler must be enough to build and run everywhere.
 
 3. **The log is the artifact.** All durable state lives in one append-only

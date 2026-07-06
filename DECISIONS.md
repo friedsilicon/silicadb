@@ -13,9 +13,7 @@ Format: `D-NNN <date> <title>` — context, decision, rejected alternatives.
 **Context:** Need daemon + CLI, zero-dependency, binary protocol, long-lived
 portable codebase. Repo was initialized with the C .gitignore template.
 
-**Decision:** C11 + POSIX. Rationale: ubiquitous toolchain (a stock `cc`
-builds it on any unix), stable ABI/language for a decade-scale artifact, no
-runtime.
+**Decision:** Zig + C11 + POSIX. Rationale: ubiquitous toolchain and no runtime
 
 **Rejected:** Rust (toolchain weight, slower iteration for a ~1.5 kLOC v0);
 Go (runtime, GC, fat binaries — not metal); Zig (strong candidate — see open
