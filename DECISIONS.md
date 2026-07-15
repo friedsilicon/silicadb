@@ -84,3 +84,25 @@ E2E daemon test (`scripts/smoke.sh`, `make check`) gate changes.
 
 **Rejected:** Keeping parallel C+Zig trees (double maintenance, drift risk —
 the log format compatibility is already proven by replay tests).
+
+## D-008 2026-07-15 RFC-0001 (spec-v0 branch) abandoned; ideas harvested
+
+**Context:** The orphan branch `spec-v0` carried RFC-0001, a normative spec
+for a SQLite-backed, MCP-fronted, JSON-valued memory store — the approaches
+D-002 and D-004 rejected. It describes a system that was never built, and it
+drifted from the implemented engine precisely because it was written ahead of
+any code.
+
+**Decision:** RFC-0001 is abandoned unmerged (PR #2 closed; the draft stays
+archived on the `spec-v0` branch). Four storage/transport-agnostic ideas are
+harvested into ROADMAP.md instead: `as_of` supersession-aware reads over the
+append-only log, a provenance TLV tag, multi-store routing with visibility
+policies, and spec discipline (numbered invariants, error registry, declared
+token estimator) applied inside SPEC.md as it grows. The one interface that
+gets normative treatment is the `silica load` compiler↔db contract, specified
+in SPEC.md when phase 2 starts.
+
+**Rejected:** Rewriting RFC-0001 against current decisions (normative spec
+for unbuilt phases repeats the mistake that orphaned it; violates principles
+4 and 6); merging it under `rfc/` as a reference document (dead weight beside
+the living SPEC.md — the branch archive suffices).

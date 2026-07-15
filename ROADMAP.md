@@ -45,6 +45,9 @@ Goal: links become measurable without breaking a byte on the wire or on disk.
   keeps strings.
 - Replace the O(n) dedup scan in `linksAdd` with per-subject hash adjacency.
   Not premature optimization: today every link insert walks every link.
+- `T_SRC` (string) provenance tag on PUT/LINK — where an assertion came from
+  (session id, agent, URL). Optional, skipped by old clients (harvested from
+  RFC-0001, D-008).
 
 Exit: tests + smoke green, new tag in SPEC.md, decision logged (D-008).
 
@@ -57,7 +60,12 @@ log stays canonical (D-004).
   `RelationEdge` arena, maintained on mutation, rebuilt on replay.
 - `category_enum` mapped from the existing kind byte.
 - CLI: `silica links <s> --pred a,b` (bitmask over interned predicate ids)
-  and `silica load` bulk ingest for sodl compiler output.
+  and `silica load` bulk ingest for sodl compiler output. The `silica load`
+  format is the compiler↔db contract — the one interface that gets a
+  normative SPEC.md section (D-008).
+- `as_of <ts>` reads: the append-only log already holds full history, so a
+  point-in-time view is replay-to-T. Supersession-aware recall ("what did I
+  believe last week") harvested from RFC-0001 (D-008).
 
 Exit: graph traversal with no per-query allocation storm; `silica load`
 input format specified in SPEC.md.
@@ -74,10 +82,22 @@ Each of these needs a decision before it is built (see open questions):
 
 Target metric for all three, per sodl-1: fewer tokens for equal recall.
 
+## Beyond graph-v1
+
+Harvested from the abandoned RFC-0001 draft (D-008), not yet phased:
+
+- **Multi-store routing + visibility policies**: separate stores per context
+  (personal / org / employer) with declarative share-and-isolate policies;
+  see `examples/routes.sodl` on the `spec-v0` branch for candidate syntax.
+- **Spec discipline as SPEC.md grows**: numbered invariants, an error-code
+  registry, a declared token-cost estimator (`ceil(bytes/4)` baseline) —
+  the RFC's style without its form.
+
 ## Open questions
 
 1. sodl spec sections 1–3 and the compiler's output format — prerequisite
-   for the `silica load` format.
+   for the `silica load` format (`routes.sodl` on `spec-v0` shows store/policy
+   syntax, but not the extraction output).
 2. Embedding source for the vector layer — the daemon does not embed; what
    does?
 3. Arena persistence: derived in-memory (recommended, consistent with D-004)
