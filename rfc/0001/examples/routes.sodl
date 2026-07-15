@@ -1,0 +1,7 @@
+// ~/.silica/routes.sodl — store routing + sync policy (SPEC.md §7)
+store personal     { path: "~/.silica/personal.silica", default: true }
+store friedsilicon { path: "~/.silica/friedsilicon.silica", match: { remote: "github.com/friedsilicon/*" } }
+store mswork       { path: "~/.silica/mswork.silica",       match: { remote: "github.com/<employer-org>/*" } }
+
+policy share_prefs  { from: personal, types: [preference, procedure], to: * }
+policy ms_isolation { from: mswork,   types: *,                       to: none }

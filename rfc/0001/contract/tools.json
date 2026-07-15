@@ -1,0 +1,27 @@
+{
+  "comment": "silica MCP tool contract v0 — SPEC.md §2. Names and shapes are permanent.",
+  "tools": [
+    { "name": "remember",
+      "description": "Assert typed facts about an entity, creating it if needed. Unknown types or predicates are rejected against the SODL schema. Call at commit points only: a decision made, a preference stated, a correction, a task-end lesson.",
+      "inputSchema": { "type": "object", "required": ["type", "facts"], "properties": {
+        "type": {"type": "string"}, "name": {"type": "string"},
+        "facts": {"type": "array", "items": {"type": "object", "required": ["predicate"], "properties": {
+          "predicate": {"type": "string"}, "value": {}, "entity_ref": {"type": "string"}}}},
+        "source": {"type": "object", "properties": {"kind": {"enum": ["session","user","tool","import"]}, "ref": {"type": "string"}}},
+        "store": {"type": "string"} } } },
+    { "name": "recall",
+      "description": "Search memory. Returns provenance-carrying facts, hard-capped at max_tokens (default 800). Superseded facts are excluded unless as_of is set. Type filter includes subtypes. Call at session start (preferences + open decisions) and before decisions.",
+      "inputSchema": { "type": "object", "required": ["query"], "properties": {
+        "query": {"type": "string"}, "type": {"type": "string"},
+        "limit": {"type": "integer", "default": 10}, "max_tokens": {"type": "integer", "default": 800},
+        "as_of": {"type": ["integer","null"]}, "stores": {"type": "array", "items": {"type": "string"}} } } },
+    { "name": "invalidate",
+      "description": "Supersede a fact with a reason. Never deletes; writes a tombstone and links the chain. Call when the user corrects the agent or a decision changes.",
+      "inputSchema": { "type": "object", "required": ["fact_id", "reason"], "properties": {
+        "fact_id": {"type": "integer"}, "reason": {"type": "string"} } } },
+    { "name": "log_event",
+      "description": "Append to the activity log. Cheap; use for anything not worth a typed fact.",
+      "inputSchema": { "type": "object", "required": ["kind", "payload"], "properties": {
+        "kind": {"type": "string"}, "actor": {"type": "string"}, "payload": {"type": "object"} } } }
+  ]
+}
