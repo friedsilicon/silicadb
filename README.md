@@ -8,9 +8,10 @@ the way they are.
 ## Build & run
 
 ```sh
-make            # builds silicadbd (daemon) + silica (CLI)
-make check      # end-to-end smoke test
-./silicadbd &   # listens on ~/.silicadb/silicadb.sock
+zig build                  # builds silicadbd (daemon) + silica (CLI) into zig-out/bin
+zig build test             # unit smoke tests (wire, store, replay)
+make check                 # end-to-end smoke test (daemon + CLI + restart)
+./zig-out/bin/silicadbd &  # listens on ~/.silicadb/silicadb.sock
 ```
 
 ## Use

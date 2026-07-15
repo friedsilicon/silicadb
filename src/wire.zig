@@ -159,8 +159,7 @@ pub fn recv(fd: c.fd_t, gpa: Allocator) (IoError || Allocator.Error)!Frame {
 
 // ---- misc ----
 
-/// crc32 over record type byte ++ payload; identical to the C implementation
-/// (standard IEEE reflected crc32), so logs are cross-readable.
+/// crc32 (standard IEEE reflected) over record type byte ++ payload.
 pub fn crcRecord(rtype: u8, pl: []const u8) u32 {
     var h = std.hash.Crc32.init();
     h.update(&.{rtype});

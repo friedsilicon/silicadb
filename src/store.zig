@@ -1,5 +1,4 @@
-//! Append-only log + in-memory index + link triples.
-//! On-disk format identical to the C implementation; see SPEC.md.
+//! Append-only log + in-memory index + link triples. Format: SPEC.md.
 
 const std = @import("std");
 const c = std.c;

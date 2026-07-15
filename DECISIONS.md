@@ -8,7 +8,7 @@ Format: `D-NNN <date> <title>` — context, decision, rejected alternatives.
 
 ---
 
-## D-001 2026-07-05 Implementation language: C11 (status: under review)
+## D-001 2026-07-05 Implementation language: C11 (status: closed by D-007)
 
 **Context:** Need daemon + CLI, zero-dependency, binary protocol, long-lived
 portable codebase. Repo was initialized with the C .gitignore template.
@@ -71,3 +71,16 @@ GET. Zero re-encoding on the read path; one `pread` per GET.
 **Consequence:** Wire TLV tags and log payload tags are the same namespace —
 protocol tag changes are storage format changes. Acceptable while both live
 in one repo and the log carries a format version.
+
+## D-007 2026-07-05 Implementation language: Zig (closes D-001)
+
+**Context:** D-001 left Zig as an open question. The full v0 surface (daemon,
+CLI, store, wire) was ported to Zig 0.16 while the codebase was still small;
+on-disk log format and wire protocol are byte-identical to the C version.
+
+**Decision:** Zig is the implementation language. C sources deleted. Build is
+`zig build`; unit smoke tests (`src/tests.zig`, `zig build test`) plus the
+E2E daemon test (`scripts/smoke.sh`, `make check`) gate changes.
+
+**Rejected:** Keeping parallel C+Zig trees (double maintenance, drift risk —
+the log format compatibility is already proven by replay tests).

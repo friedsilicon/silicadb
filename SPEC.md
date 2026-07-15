@@ -3,7 +3,7 @@
 A minimal, metal-first memory daemon for AI sessions. One append-only log per
 machine holds every memory record and every semantic link ever written. A tiny
 binary protocol connects clients (CLI today, editor/agent hooks tomorrow) to a
-single daemon. No JSON, no runtime dependencies, C11.
+single daemon. No JSON, no runtime dependencies, Zig.
 
 ## Goals
 
