@@ -60,12 +60,16 @@ Unknown tags are skipped — forward compatible by construction.
 |------|-------|------------------------------------|-------------------------------------|
 | 0x01 | HELLO | VERSION                            | VERSION                             |
 | 0x02 | PING  | —                                  | —                                   |
-| 0x10 | PUT   | KEY, [KIND], [TAGS], [TS], BODY    | —                                   |
-| 0x11 | GET   | KEY                                | KEY, KIND, TAGS, TS, BODY (stored)  |
+| 0x10 | PUT   | KEY, [KIND], [TAGS], [SRC], [TS], BODY | —                               |
+| 0x11 | GET   | KEY, [ASOF]                        | KEY, KIND, TAGS, TS, BODY (stored)  |
 | 0x12 | DEL   | KEY                                | —                                   |
 | 0x13 | LIST  | [PREFIX]                           | (KEY, KIND, TS)*                    |
 | 0x20 | LINK  | SUBJ, PRED, OBJ, [WEIGHT], [SRC]   | —                                   |
-| 0x21 | LINKS | [KEY]                              | (SUBJ, PRED, OBJ, WEIGHT, [SRC], TS)* |
+| 0x21 | LINKS | [KEY], PRED*                       | (SUBJ, PRED, OBJ, WEIGHT, [SRC], TS)* |
+
+GET with ASOF answers as of that instant by rescanning the log (linear; fine
+until measured otherwise). LINKS with one or more PRED tags returns only
+those predicates; a predicate the store has never seen matches nothing.
 | 0x30 | STATS | —                                  | NKEYS, NLINKS, BYTES                |
 
 Status codes: `0 OK, 1 NOTFOUND, 2 BADREQ, 3 IO, 4 VERSION, 5 TOOBIG`.
@@ -90,6 +94,7 @@ Status codes: `0 OK, 1 NOTFOUND, 2 BADREQ, 3 IO, 4 VERSION, 5 TOOBIG`.
 | 14  | MSG     | utf8 | optional error text on responses       |
 | 15  | WEIGHT  | f32  | link weight, IEEE 754 le; must be finite; default 1.0 |
 | 16  | SRC     | utf8 | provenance (session/agent/url), ≤255 bytes |
+| 17  | ASOF    | u64  | GET: answer as of this instant (ns)    |
 
 If a PUT arrives without TS the server appends one; otherwise the client
 payload is stored verbatim — and returned verbatim on GET.
@@ -103,11 +108,44 @@ records:
 [u32 paylen][u32 crc32(type ‖ payload)][u8 type][payload TLVs]
 ```
 
-Record types: `1 PUT, 2 DEL, 3 LINK`. Startup replays the log into an
-open-addressing hash index (key → payload offset/len, kind, ts) and an
-in-memory triple array. A corrupt tail (torn write) is detected by crc/length
-and truncated. Every mutation is one `write` + `fsync`. GET is a single
-`pread` at the indexed offset.
+Record types: `1 PUT, 2 DEL, 3 LINK`. DEL records carry TS (older logs
+without it stay readable: for as-of reads such a record inherits the previous
+record's ts). Startup replays the log into an open-addressing hash index
+(key → payload offset/len, kind, ts), an in-memory triple array, and the
+derived graph kernel below. A corrupt tail (torn write) is detected by
+crc/length and truncated. Every mutation is one `write` + `fsync`. GET is a
+single `pread` at the indexed offset.
+
+### Derived graph kernel
+
+Everything here is rebuilt from the log on replay; none of it is on disk.
+Predicates intern to dense u16 ids. Every PUT key and every link endpoint
+gets a fixed-size `EntityNode` (wyhash-64 of the key, name length, category =
+kind byte, or 0xff for link-only endpoints, and reserved vector offset);
+edges live in one arena as `RelationEdge` (target node index, predicate id,
+f32 weight, ts) chained per subject node. Last write per (subject, predicate,
+object) wins, updating weight/src/ts in both the triple array and the edge.
+
+## Bulk load (normative: the sodl-compiler contract)
+
+`silica load` reads UTF-8 lines from stdin. This is the one interface a
+separate program (the sodl compiler) must produce, so it is normative:
+tab-separated fields, one operation per line.
+
+```
+put  <TAB> key <TAB> kind <TAB> tags <TAB> src <TAB> body
+link <TAB> subj <TAB> pred <TAB> obj [<TAB> weight [<TAB> src]]
+```
+
+- `kind` is a kind name (`note fact pref project ref`) or 0–255; empty means
+  note. Empty `tags`/`src` are omitted. `weight` empty or absent means 1.0
+  and must be finite. `key`, `subj`, `pred`, `obj` must be non-empty.
+- `put` body is everything after the fifth tab and may itself contain tabs;
+  it cannot contain a newline.
+- Blank lines and lines starting with `#` are skipped. Any other line is an
+  error: the loader stops with the line number and nothing further is sent.
+- Lines apply in order with server-assigned timestamps; a `link` may
+  reference keys that were never `put`.
 
 Compaction (rewrite live records into a fresh log) is deliberately deferred —
 the log doubles as full history until then.

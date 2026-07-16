@@ -18,6 +18,32 @@ const R_LINK: u8 = 3;
 pub const Slot = struct { off: u64, len: u32, kind: u8, ts: u64 };
 pub const Link = struct { s: []u8, pid: u16, o: []u8, ts: u64, w: f32, src: []u8 };
 
+pub const NONE: u32 = 0xffff_ffff;
+
+/// sodl graph kernel node (derived from the log; fixed-size, arena-resident).
+/// `target` in RelationEdge is a node index — the sodl spec's u64 id_hash is
+/// one lookup away via nodes.items[target].id_hash.
+pub const EntityNode = struct {
+    id_hash: u64,
+    name_len: u16,
+    category_enum: u8,
+    vector_offset: u64 = 0, // reserved: HNSW/vector layer
+    edge_head: u32 = NONE,
+    edge_count: u32 = 0,
+};
+
+pub const RelationEdge = struct {
+    target: u32,
+    pid: u16,
+    w: f32,
+    ts: u64,
+    next: u32 = NONE,
+};
+
+pub fn idHash(key: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, key);
+}
+
 pub const Store = struct {
     gpa: Allocator,
     fd: c.fd_t,
@@ -28,6 +54,10 @@ pub const Store = struct {
     preds: std.ArrayList([]u8) = .empty,
     pred_ids: std.StringHashMapUnmanaged(u16) = .empty,
     adj: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty,
+    // derived, rebuilt on replay: sodl graph kernel (nodes + intrusive edge chains)
+    nodes: std.ArrayList(EntityNode) = .empty,
+    node_by_hash: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    edges: std.ArrayList(RelationEdge) = .empty,
 
     pub const Error = error{ Io, BadPayload, OutOfMemory };
 
@@ -107,6 +137,9 @@ pub const Store = struct {
             e.value_ptr.deinit(st.gpa);
         }
         st.adj.deinit(st.gpa);
+        st.nodes.deinit(st.gpa);
+        st.node_by_hash.deinit(st.gpa);
+        st.edges.deinit(st.gpa);
         _ = c.close(st.fd);
     }
 
@@ -131,14 +164,51 @@ pub const Store = struct {
     }
 
     /// true if deleted, false if missing.
-    pub fn del(st: *Store, key: []const u8) Error!bool {
+    pub fn del(st: *Store, key: []const u8, ts: u64) Error!bool {
         if (!st.idx.contains(key)) return false;
         var b: std.ArrayList(u8) = .empty;
         defer b.deinit(st.gpa);
         try wire.tlv(&b, st.gpa, proto.T_KEY, key);
+        try wire.tlvU64(&b, st.gpa, proto.T_TS, ts);
         _ = try st.append(R_DEL, b.items);
         if (st.idx.fetchRemove(key)) |kv| st.gpa.free(kv.key);
         return true;
+    }
+
+    /// Point-in-time GET: replay the log up to `asof` (ns, inclusive) for one
+    /// key. Records without TS (pre-phase-2 DELs) inherit the previous
+    /// record's ts — sound because the log is appended in time order.
+    pub fn getAsOf(st: *Store, gpa: Allocator, key: []const u8, asof: u64) Error!?[]u8 {
+        var off: u64 = 8;
+        var buf: []u8 = &.{};
+        defer gpa.free(buf);
+        var found: ?struct { off: u64, len: u32 } = null;
+        var last_ts: u64 = 0;
+        while (off + REC_HDR <= st.end) {
+            var rh: [REC_HDR]u8 = undefined;
+            if (c.pread(st.fd, &rh, REC_HDR, @intCast(off)) != REC_HDR) break;
+            const n = std.mem.readInt(u32, rh[0..4], .little);
+            const rtype = rh[8];
+            if (n > proto.MAX_PAYLOAD or off + REC_HDR + n > st.end) break;
+            if (n > buf.len) buf = try gpa.realloc(buf, n);
+            const pl = buf[0..n];
+            if (n > 0 and c.pread(st.fd, pl.ptr, n, @intCast(off + REC_HDR)) != n) break;
+            // no crc re-check: open() already truncated any corrupt tail
+            const rts = (wire.findU64(pl, proto.T_TS) catch null) orelse last_ts;
+            last_ts = rts;
+            if (rts <= asof and (rtype == R_PUT or rtype == R_DEL)) {
+                const k = (wire.findStr(pl, proto.T_KEY, proto.KEY_MAX) catch null) orelse "";
+                if (std.mem.eql(u8, k, key)) {
+                    found = if (rtype == R_PUT) .{ .off = off + REC_HDR, .len = n } else null;
+                }
+            }
+            off += REC_HDR + n;
+        }
+        const f = found orelse return null;
+        const b = try gpa.alloc(u8, f.len);
+        errdefer gpa.free(b);
+        if (f.len > 0 and c.pread(st.fd, b.ptr, f.len, @intCast(f.off)) != f.len) return error.Io;
+        return b;
     }
 
     pub fn link(st: *Store, s: []const u8, p: []const u8, o: []const u8, w: f32, src: []const u8, ts: u64) Error!void {
@@ -170,6 +240,14 @@ pub const Store = struct {
         return st.links.items.len;
     }
 
+    pub fn nnodes(st: *Store) u64 {
+        return st.nodes.items.len;
+    }
+
+    pub fn nedges(st: *Store) u64 {
+        return st.edges.items.len;
+    }
+
     pub fn bytes(st: *Store) u64 {
         return st.end;
     }
@@ -192,6 +270,7 @@ pub const Store = struct {
     }
 
     fn idxSet(st: *Store, key: []const u8, slot: Slot) Error!void {
+        _ = try st.nodeIntern(key, slot.kind);
         if (st.idx.getPtr(key)) |v| {
             v.* = slot;
             return;
@@ -199,6 +278,49 @@ pub const Store = struct {
         const k = try st.gpa.dupe(u8, key);
         errdefer st.gpa.free(k);
         try st.idx.put(st.gpa, k, slot);
+    }
+
+    /// Get-or-create the graph node for key. `cat` updates the category when
+    /// known (PUT); link endpoints created without one get 0xff.
+    fn nodeIntern(st: *Store, key: []const u8, cat: ?u8) Error!u32 {
+        const h = idHash(key);
+        if (st.node_by_hash.get(h)) |i| {
+            if (cat) |cv| st.nodes.items[i].category_enum = cv;
+            return i;
+        }
+        const i: u32 = @intCast(st.nodes.items.len);
+        try st.nodes.append(st.gpa, .{
+            .id_hash = h,
+            .name_len = @intCast(@min(key.len, std.math.maxInt(u16))),
+            .category_enum = cat orelse 0xff,
+        });
+        errdefer _ = st.nodes.pop();
+        try st.node_by_hash.put(st.gpa, h, i);
+        return i;
+    }
+
+    /// Append or update (dedup on pid+target) an edge in sidx's chain.
+    fn edgeAdd(st: *Store, sidx: u32, oidx: u32, pid: u16, w: f32, ts: u64) Error!void {
+        var ei = st.nodes.items[sidx].edge_head;
+        while (ei != NONE) {
+            const e = &st.edges.items[ei];
+            if (e.pid == pid and e.target == oidx) {
+                e.w = w;
+                e.ts = ts;
+                return;
+            }
+            ei = e.next;
+        }
+        const ni: u32 = @intCast(st.edges.items.len);
+        try st.edges.append(st.gpa, .{
+            .target = oidx,
+            .pid = pid,
+            .w = w,
+            .ts = ts,
+            .next = st.nodes.items[sidx].edge_head,
+        });
+        st.nodes.items[sidx].edge_head = ni;
+        st.nodes.items[sidx].edge_count += 1;
     }
 
     fn predIntern(st: *Store, name: []const u8) Error!u16 {
@@ -216,6 +338,10 @@ pub const Store = struct {
     /// Dedup key is (subject, predicate, object); a repeat updates ts/w/src.
     fn linksAdd(st: *Store, s: []const u8, p: []const u8, o: []const u8, ts: u64, w: f32, src: []const u8) Error!void {
         const pid = try st.predIntern(p);
+        // mirror into the graph kernel (edgeAdd dedups within the chain)
+        const sidx = try st.nodeIntern(s, null);
+        const oidx = try st.nodeIntern(o, null);
+        try st.edgeAdd(sidx, oidx, pid, w, ts);
         if (st.adj.getPtr(s)) |bucket| {
             for (bucket.items) |li| {
                 const l = &st.links.items[li];

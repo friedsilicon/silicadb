@@ -99,7 +99,14 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                     status = proto.ST_BADREQ;
                     break :blk;
                 }
-                const stored = g_st.get(gpa, key) catch |e| {
+                const asof = wire.findU64(pl, proto.T_ASOF) catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                };
+                const stored = if (asof) |ts| g_st.getAsOf(gpa, key, ts) catch |e| {
+                    status = stFromErr(e);
+                    break :blk;
+                } else g_st.get(gpa, key) catch |e| {
                     status = stFromErr(e);
                     break :blk;
                 };
@@ -121,7 +128,7 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                     status = proto.ST_BADREQ;
                     break :blk;
                 }
-                const deleted = g_st.del(key) catch |e| {
+                const deleted = g_st.del(key, wire.nowNs()) catch |e| {
                     status = stFromErr(e);
                     break :blk;
                 };
@@ -168,9 +175,47 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                     status = proto.ST_BADREQ;
                     break :blk;
                 };
+                // optional predicate filter: repeated T_PRED tags. Interned
+                // ids < 64 test against a u64 bitmask; the rest a small list.
+                // A predicate the store has never seen matches nothing.
+                var fmask: u64 = 0;
+                var fids: [16]u16 = undefined;
+                var nf: usize = 0;
+                var requested = false;
+                var pcur = wire.Cur{ .p = pl };
+                while (pcur.next() catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                }) |tv| {
+                    if (tv.tag != proto.T_PRED) continue;
+                    requested = true;
+                    if (g_st.pred_ids.get(tv.val)) |id| {
+                        if (id < 64) {
+                            fmask |= @as(u64, 1) << @intCast(id);
+                        } else if (nf < fids.len) {
+                            fids[nf] = id;
+                            nf += 1;
+                        } else {
+                            status = proto.ST_TOOBIG;
+                            break :blk;
+                        }
+                    }
+                }
                 for (g_st.links.items) |l| {
                     if (key) |k| {
                         if (!std.mem.eql(u8, l.s, k) and !std.mem.eql(u8, l.o, k)) continue;
+                    }
+                    if (requested) {
+                        var hit = false;
+                        if (l.pid < 64) {
+                            hit = (fmask >> @intCast(l.pid)) & 1 == 1;
+                        } else for (fids[0..nf]) |id| {
+                            if (id == l.pid) {
+                                hit = true;
+                                break;
+                            }
+                        }
+                        if (!hit) continue;
                     }
                     wire.tlv(&r, gpa, proto.T_SUBJ, l.s) catch break;
                     wire.tlv(&r, gpa, proto.T_PRED, g_st.predName(l.pid)) catch break;
