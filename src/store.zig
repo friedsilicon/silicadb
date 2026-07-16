@@ -44,6 +44,30 @@ pub fn idHash(key: []const u8) u64 {
     return std.hash.Wyhash.hash(0, key);
 }
 
+/// Exponential half-life decay: w * 2^(-age/halflife). halflife 0 = off.
+pub fn decayed(w: f32, age_ns: u64, halflife_ns: u64) f32 {
+    if (halflife_ns == 0) return w;
+    const e = @as(f64, @floatFromInt(age_ns)) / @as(f64, @floatFromInt(halflife_ns));
+    return @floatCast(@as(f64, w) * std.math.exp2(-e));
+}
+
+/// Cosine similarity; null on dimension mismatch or zero-norm input.
+pub fn cosine(a: []const f32, b: []const f32) ?f32 {
+    if (a.len != b.len) return null;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        const fx: f64 = x;
+        const fy: f64 = y;
+        dot += fx * fy;
+        na += fx * fx;
+        nb += fy * fy;
+    }
+    if (na == 0 or nb == 0) return null;
+    return @floatCast(dot / (std.math.sqrt(na) * std.math.sqrt(nb)));
+}
+
 pub const Store = struct {
     gpa: Allocator,
     fd: c.fd_t,
@@ -58,6 +82,8 @@ pub const Store = struct {
     nodes: std.ArrayList(EntityNode) = .empty,
     node_by_hash: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     edges: std.ArrayList(RelationEdge) = .empty,
+    // derived, rebuilt on replay: embeddings (key -> f32 vector, from T_VEC on PUT)
+    vecs: std.StringHashMapUnmanaged([]f32) = .empty,
 
     pub const Error = error{ Io, BadPayload, OutOfMemory };
 
@@ -140,6 +166,12 @@ pub const Store = struct {
         st.nodes.deinit(st.gpa);
         st.node_by_hash.deinit(st.gpa);
         st.edges.deinit(st.gpa);
+        var vit = st.vecs.iterator();
+        while (vit.next()) |e| {
+            st.gpa.free(e.key_ptr.*);
+            st.gpa.free(e.value_ptr.*);
+        }
+        st.vecs.deinit(st.gpa);
         _ = c.close(st.fd);
     }
 
@@ -150,8 +182,13 @@ pub const Store = struct {
         if (key.len == 0) return error.BadPayload;
         const kind = (wire.findU8(pl, proto.T_KIND) catch return error.BadPayload) orelse 0;
         const ts = (wire.findU64(pl, proto.T_TS) catch return error.BadPayload) orelse 0;
+        const vb = wire.find(pl, proto.T_VEC) catch return error.BadPayload;
+        if (vb) |v| {
+            if (v.len == 0 or v.len % 4 != 0 or v.len / 4 > proto.VEC_DIM_MAX) return error.BadPayload;
+        }
         const off = try st.append(R_PUT, pl);
         try st.idxSet(key, .{ .off = off, .len = @intCast(pl.len), .kind = kind, .ts = ts });
+        if (vb) |v| try st.vecSet(key, v);
     }
 
     /// Returns stored payload (caller frees with gpa) or null if missing.
@@ -172,6 +209,7 @@ pub const Store = struct {
         try wire.tlvU64(&b, st.gpa, proto.T_TS, ts);
         _ = try st.append(R_DEL, b.items);
         if (st.idx.fetchRemove(key)) |kv| st.gpa.free(kv.key);
+        st.vecDel(key);
         return true;
     }
 
@@ -244,6 +282,10 @@ pub const Store = struct {
         return st.nodes.items.len;
     }
 
+    pub fn nvecs(st: *Store) u64 {
+        return st.vecs.count();
+    }
+
     pub fn nedges(st: *Store) u64 {
         return st.edges.items.len;
     }
@@ -297,6 +339,33 @@ pub const Store = struct {
         errdefer _ = st.nodes.pop();
         try st.node_by_hash.put(st.gpa, h, i);
         return i;
+    }
+
+    /// Decode a validated T_VEC byte payload and (re)attach it to key.
+    fn vecSet(st: *Store, key: []const u8, raw: []const u8) Error!void {
+        if (raw.len == 0 or raw.len % 4 != 0 or raw.len / 4 > proto.VEC_DIM_MAX)
+            return error.BadPayload;
+        const dim = raw.len / 4;
+        const v = try st.gpa.alloc(f32, dim);
+        errdefer st.gpa.free(v);
+        for (v, 0..) |*f, i| f.* = @bitCast(std.mem.readInt(u32, raw[i * 4 ..][0..4], .little));
+        const gop = try st.vecs.getOrPut(st.gpa, key);
+        if (gop.found_existing) {
+            st.gpa.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = st.gpa.dupe(u8, key) catch |e| {
+                st.vecs.removeByPtr(gop.key_ptr);
+                return e;
+            };
+        }
+        gop.value_ptr.* = v;
+    }
+
+    fn vecDel(st: *Store, key: []const u8) void {
+        if (st.vecs.fetchRemove(key)) |kv| {
+            st.gpa.free(kv.key);
+            st.gpa.free(kv.value);
+        }
     }
 
     /// Append or update (dedup on pid+target) an edge in sidx's chain.
@@ -385,12 +454,19 @@ pub const Store = struct {
                 if (key.len == 0) return error.BadPayload;
                 const kind = (wire.findU8(pl, proto.T_KIND) catch return error.BadPayload) orelse 0;
                 const ts = (wire.findU64(pl, proto.T_TS) catch return error.BadPayload) orelse 0;
+                const vb = wire.find(pl, proto.T_VEC) catch return error.BadPayload;
+                if (vb) |v| {
+                    if (v.len == 0 or v.len % 4 != 0 or v.len / 4 > proto.VEC_DIM_MAX)
+                        return error.BadPayload;
+                }
                 try st.idxSet(key, .{ .off = off, .len = @intCast(pl.len), .kind = kind, .ts = ts });
+                if (vb) |v| try st.vecSet(key, v);
             },
             R_DEL => {
                 const key = (wire.findStr(pl, proto.T_KEY, proto.KEY_MAX) catch return error.BadPayload) orelse
                     return error.BadPayload;
                 if (st.idx.fetchRemove(key)) |kv| st.gpa.free(kv.key);
+                st.vecDel(key);
             },
             R_LINK => {
                 const s = (wire.findStr(pl, proto.T_SUBJ, proto.KEY_MAX) catch return error.BadPayload) orelse

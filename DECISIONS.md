@@ -147,3 +147,29 @@ rebuildable index; revisit when replay time hurts — ROADMAP open question 3);
 as-of via per-key version chains in memory (state grows with history; the log
 already is the history); id_hash as edge target (u64 vs u32, no read either
 way); JSON/CSV load formats (tabs need no quoting layer for this data).
+
+## D-011 2026-07-15 Read-time decay & rollup; caller-supplied vectors (phase 3)
+
+**Context:** ROADMAP.md phase 3 — the three sodl-1 experiments (temporal
+decay, hierarchical aggregation, similarity) each needed a semantics
+decision; defaults chosen and recorded here.
+
+**Decision:** All three are **read-time and stateless**; the log and stored
+weights never change. Decay: LINKS + HALFLIFE (tag 18) returns
+`w · 2^(−age/halflife)`; the half-life is a per-query parameter, not store
+config. Aggregation: LINKS + ROLLUP n (tag 19) collapses (subject, predicate)
+groups of ≥ n into one pseudo-row (OBJ `*`, max decayed weight, latest ts,
+COUNT tag 20) — computed per query, *not* materialized in idle daemon cycles
+as sodl-1 sketched: no invalidation problem, no background machinery, and
+principle 6 says measure before caching. Vectors: embeddings are
+caller-supplied (VEC tag 21 on PUT, ≤4096 f32 dims — the daemon never embeds,
+answering ROADMAP open question 2); SIM (0x31) is brute-force cosine with
+top-k insertion (LIMIT tag 22, default 10, cap 100); vectors ride the normal
+PUT payload so they replay like everything else. HNSW and `vector_offset`
+stay reserved until brute force measurably hurts.
+
+**Rejected:** Store-level decay config (a query-shape concern; different
+callers want different horizons); materialized pseudo-nodes (write
+amplification + staleness for an unmeasured win); daemon-side embedding
+(pulls a model dependency into a zero-dependency binary); separate vector
+sidecar file (violates "the log is the artifact").

@@ -47,14 +47,18 @@ fn usage() noreturn {
         \\usage: silica <command> [args]
         \\
         \\  ping                                  round-trip check
-        \\  put <key> [-k kind] [-t tags] [-s src] [body]
+        \\  put <key> [-k kind] [-t tags] [-s src] [-V f,f,..] [body]
         \\                                        store record (no body: read stdin)
         \\  get <key> [-v] [-a ts]                print body (-v: meta; -a: as-of unix s|ns)
         \\  rm <key>                              delete record
         \\  ls [prefix]                           list keys
         \\  link <subj> <pred> <obj> [-w weight] [-s src]
         \\                                        add semantic triple (weight: f32, default 1)
-        \\  links [key] [-p pred[,pred]]          list triples (touching key; -p: filter)
+        \\  links [key] [-p pred[,pred]] [-d dur] [-r n]
+        \\                                        list triples (-p: predicate filter;
+        \\                                        -d: decay half-life 30s|5m|2h|7d|1w;
+        \\                                        -r: roll up groups of >= n)
+        \\  sim <f,f,..> [-n k]                   top-k keys by cosine similarity
         \\  load                                  bulk ingest TSV lines from stdin (SPEC.md)
         \\  stats                                 store statistics
         \\
@@ -93,6 +97,54 @@ fn kindName(k: u8, buf: []u8) []const u8 {
 fn asofParse(s: []const u8) ?u64 {
     const v = std.fmt.parseInt(u64, s, 10) catch return null;
     return if (v < 100_000_000_000) v * 1_000_000_000 else v;
+}
+
+/// duration → ns: integer with optional s/m/h/d/w suffix (bare = seconds).
+fn durParse(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var mult: u64 = 1_000_000_000;
+    var num = s;
+    switch (s[s.len - 1]) {
+        's' => num = s[0 .. s.len - 1],
+        'm' => {
+            mult *= 60;
+            num = s[0 .. s.len - 1];
+        },
+        'h' => {
+            mult *= 3600;
+            num = s[0 .. s.len - 1];
+        },
+        'd' => {
+            mult *= 86400;
+            num = s[0 .. s.len - 1];
+        },
+        'w' => {
+            mult *= 604800;
+            num = s[0 .. s.len - 1];
+        },
+        else => {},
+    }
+    const v = std.fmt.parseInt(u64, num, 10) catch return null;
+    if (v == 0) return null;
+    return v * mult;
+}
+
+/// comma-separated floats → little-endian f32 bytes (caller frees).
+fn vecBytes(spec: []const u8) []u8 {
+    var b: std.ArrayList(u8) = .empty;
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |tok| {
+        const tr = std.mem.trim(u8, tok, " ");
+        if (tr.len == 0) continue;
+        const f = std.fmt.parseFloat(f32, tr) catch die("bad vector component: {s}", .{tr});
+        if (!std.math.isFinite(f)) die("bad vector component: {s}", .{tr});
+        var t4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &t4, @bitCast(f), .little);
+        b.appendSlice(gpa, &t4) catch die("oom", .{});
+    }
+    if (b.items.len == 0) die("empty vector", .{});
+    if (b.items.len / 4 > proto.VEC_DIM_MAX) die("vector too long (max {d})", .{proto.VEC_DIM_MAX});
+    return b.items;
 }
 
 fn fmtTs(ns: u64, buf: []u8) []const u8 {
@@ -180,6 +232,7 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
     var kind: u8 = proto.K_NOTE;
     var tags: ?[]const u8 = null;
     var src: ?[]const u8 = null;
+    var vec: ?[]const u8 = null;
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
     var have_words = false;
@@ -195,6 +248,9 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, args[i], "-s") and i + 1 < args.len) {
             i += 1;
             src = args[i];
+        } else if (std.mem.eql(u8, args[i], "-V") and i + 1 < args.len) {
+            i += 1;
+            vec = args[i];
         } else {
             if (have_words) body.append(gpa, ' ') catch die("oom", .{});
             body.appendSlice(gpa, args[i]) catch die("oom", .{});
@@ -208,6 +264,11 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
     wire.tlvU8(&req, gpa, proto.T_KIND, kind) catch die("oom", .{});
     if (tags) |t| wire.tlv(&req, gpa, proto.T_TAGS, t) catch die("oom", .{});
     if (src) |s| wire.tlv(&req, gpa, proto.T_SRC, s) catch die("oom", .{});
+    if (vec) |v| {
+        const vb = vecBytes(v);
+        defer gpa.free(vb);
+        wire.tlv(&req, gpa, proto.T_VEC, vb) catch die("oom", .{});
+    }
     wire.tlvU64(&req, gpa, proto.T_TS, wire.nowNs()) catch die("oom", .{});
     if (have_words) {
         wire.tlv(&req, gpa, proto.T_BODY, body.items) catch die("oom", .{});
@@ -352,11 +413,21 @@ fn cmdLink(fd: c.fd_t, args: []const []const u8) u8 {
 fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
     var key: ?[]const u8 = null;
     var preds: ?[]const u8 = null;
+    var halflife: ?u64 = null;
+    var rollup: ?u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-p") and i + 1 < args.len) {
             i += 1;
             preds = args[i];
+        } else if (std.mem.eql(u8, args[i], "-d") and i + 1 < args.len) {
+            i += 1;
+            halflife = durParse(args[i]) orelse die("bad half-life: {s}", .{args[i]});
+        } else if (std.mem.eql(u8, args[i], "-r") and i + 1 < args.len) {
+            i += 1;
+            const n = std.fmt.parseInt(u8, args[i], 10) catch die("bad rollup size: {s}", .{args[i]});
+            if (n == 0) die("bad rollup size: {s}", .{args[i]});
+            rollup = n;
         } else if (key == null) {
             key = args[i];
         } else usage();
@@ -370,6 +441,8 @@ fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
             if (p.len > 0) wire.tlv(&req, gpa, proto.T_PRED, p) catch die("oom", .{});
         }
     }
+    if (halflife) |hl| wire.tlvU64(&req, gpa, proto.T_HALFLIFE, hl) catch die("oom", .{});
+    if (rollup) |n| wire.tlvU8(&req, gpa, proto.T_ROLLUP, n) catch die("oom", .{});
     const r = call(fd, proto.OP_LINKS, req.items);
     defer gpa.free(r.pl);
     if (r.st != proto.ST_OK) die("links: {s}", .{stStr(r.st)});
@@ -380,6 +453,7 @@ fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
     var o: []const u8 = "";
     var w: f32 = 1.0;
     var src: []const u8 = "";
+    var count: u32 = 0;
     while (cur.next() catch die("bad response", .{})) |t| {
         if (t.tag == proto.T_SUBJ) {
             s = t.val;
@@ -391,16 +465,57 @@ fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
             w = @bitCast(std.mem.readInt(u32, t.val[0..4], .little));
         } else if (t.tag == proto.T_SRC) {
             src = t.val;
+        } else if (t.tag == proto.T_COUNT and t.val.len == 4) {
+            count = std.mem.readInt(u32, t.val[0..4], .little);
         } else if (t.tag == proto.T_TS and t.val.len == 8) {
             var tb: [32]u8 = undefined;
             const ts = std.mem.readInt(u64, t.val[0..8], .little);
-            if (src.len > 0) {
+            if (count > 0) {
+                outPrint("{s} -[{s}]-> * ({d} objects)  w<={d:.2}  ({s})\n", .{ s, p, count, w, fmtTs(ts, &tb) });
+            } else if (src.len > 0) {
                 outPrint("{s} -[{s}]-> {s}  w={d:.2}  src={s}  ({s})\n", .{ s, p, o, w, src, fmtTs(ts, &tb) });
             } else {
                 outPrint("{s} -[{s}]-> {s}  w={d:.2}  ({s})\n", .{ s, p, o, w, fmtTs(ts, &tb) });
             }
             w = 1.0;
             src = "";
+            count = 0;
+        }
+    }
+    return 0;
+}
+
+fn cmdSim(fd: c.fd_t, args: []const []const u8) u8 {
+    var spec: ?[]const u8 = null;
+    var limit: ?u32 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
+            i += 1;
+            limit = std.fmt.parseInt(u32, args[i], 10) catch die("bad limit: {s}", .{args[i]});
+        } else if (spec == null) {
+            spec = args[i];
+        } else usage();
+    }
+    const vb = vecBytes(spec orelse usage());
+    defer gpa.free(vb);
+
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    wire.tlv(&req, gpa, proto.T_VEC, vb) catch die("oom", .{});
+    if (limit) |n| wire.tlvU32(&req, gpa, proto.T_LIMIT, n) catch die("oom", .{});
+    const r = call(fd, proto.OP_SIM, req.items);
+    defer gpa.free(r.pl);
+    if (r.st != proto.ST_OK) die("sim: {s}", .{stStr(r.st)});
+
+    var cur = wire.Cur{ .p = r.pl };
+    var key: []const u8 = "";
+    while (cur.next() catch die("bad response", .{})) |t| {
+        if (t.tag == proto.T_KEY) {
+            key = t.val;
+        } else if (t.tag == proto.T_WEIGHT and t.val.len == 4) {
+            const sc: f32 = @bitCast(std.mem.readInt(u32, t.val[0..4], .little));
+            outPrint("{d:.4}  {s}\n", .{ sc, key });
         }
     }
     return 0;
@@ -484,6 +599,7 @@ pub export fn main(argc: c_int, argv: [*][*:0]u8) c_int {
     if (std.mem.eql(u8, cmd, "ls")) return cmdLs(fd, rest);
     if (std.mem.eql(u8, cmd, "link")) return cmdLink(fd, rest);
     if (std.mem.eql(u8, cmd, "links")) return cmdLinks(fd, rest);
+    if (std.mem.eql(u8, cmd, "sim")) return cmdSim(fd, rest);
     if (std.mem.eql(u8, cmd, "load")) return cmdLoad(fd, rest);
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(fd);
     usage();

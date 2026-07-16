@@ -60,16 +60,23 @@ Unknown tags are skipped — forward compatible by construction.
 |------|-------|------------------------------------|-------------------------------------|
 | 0x01 | HELLO | VERSION                            | VERSION                             |
 | 0x02 | PING  | —                                  | —                                   |
-| 0x10 | PUT   | KEY, [KIND], [TAGS], [SRC], [TS], BODY | —                               |
+| 0x10 | PUT   | KEY, [KIND], [TAGS], [SRC], [VEC], [TS], BODY | —                        |
 | 0x11 | GET   | KEY, [ASOF]                        | KEY, KIND, TAGS, TS, BODY (stored)  |
 | 0x12 | DEL   | KEY                                | —                                   |
 | 0x13 | LIST  | [PREFIX]                           | (KEY, KIND, TS)*                    |
 | 0x20 | LINK  | SUBJ, PRED, OBJ, [WEIGHT], [SRC]   | —                                   |
-| 0x21 | LINKS | [KEY], PRED*                       | (SUBJ, PRED, OBJ, WEIGHT, [SRC], TS)* |
+| 0x21 | LINKS | [KEY], PRED*, [HALFLIFE], [ROLLUP] | (SUBJ, PRED, OBJ, WEIGHT, [SRC], [COUNT], TS)* |
+| 0x31 | SIM   | VEC, [LIMIT]                       | (KEY, WEIGHT)* best-first           |
 
 GET with ASOF answers as of that instant by rescanning the log (linear; fine
 until measured otherwise). LINKS with one or more PRED tags returns only
 those predicates; a predicate the store has never seen matches nothing.
+HALFLIFE applies exponential decay `w · 2^(−age/halflife)` to returned
+weights at read time — stored weights never change. ROLLUP n groups rows by
+(subject, predicate); a group with ≥ n members collapses to one pseudo-row
+(OBJ `*`, max decayed weight, latest TS, COUNT) — token-lean summaries of
+dense fan-out. SIM is brute-force cosine over stored vectors; vectors whose
+dimension differs from the query are skipped, WEIGHT carries the score.
 | 0x30 | STATS | —                                  | NKEYS, NLINKS, BYTES                |
 
 Status codes: `0 OK, 1 NOTFOUND, 2 BADREQ, 3 IO, 4 VERSION, 5 TOOBIG`.
@@ -95,6 +102,11 @@ Status codes: `0 OK, 1 NOTFOUND, 2 BADREQ, 3 IO, 4 VERSION, 5 TOOBIG`.
 | 15  | WEIGHT  | f32  | link weight, IEEE 754 le; must be finite; default 1.0 |
 | 16  | SRC     | utf8 | provenance (session/agent/url), ≤255 bytes |
 | 17  | ASOF    | u64  | GET: answer as of this instant (ns)    |
+| 18  | HALFLIFE| u64  | LINKS: decay half-life (ns); 0/absent = off |
+| 19  | ROLLUP  | u8   | LINKS: min group size to collapse; absent = off |
+| 20  | COUNT   | u32  | rollup pseudo-row: member count        |
+| 21  | VEC     | f32[]| little-endian embedding, ≤4096 dims    |
+| 22  | LIMIT   | u32  | SIM: max results (default 10, cap 100) |
 
 If a PUT arrives without TS the server appends one; otherwise the client
 payload is stored verbatim — and returned verbatim on GET.
@@ -161,8 +173,9 @@ the log doubles as full history until then.
 
 ## Roadmap
 
-- **v1**: `VEC` TLV (f32[] embedding) on PUT, `SEARCH` opcode (brute-force
-  cosine, later HNSW); TCP transport + auth token; log compaction.
-- **v2**: `silica export` → N-Triples/RDF of the link graph; multi-machine
-  merge (log records are naturally mergeable by timestamp); session-capture
-  hooks for AI agents (Claude Code memory hook → `silica put`).
+See ROADMAP.md. Delivered so far: weighted/interned/provenance-carrying
+links (D-009), derived graph kernel + as-of reads + bulk load (D-010),
+read-time decay/rollup + vector similarity (D-011). Still ahead: HNSW when
+brute force measurably hurts; TCP transport + auth token; log compaction;
+`silica export` → N-Triples/RDF; multi-machine merge; session-capture hooks
+for AI agents (Claude Code memory hook → `silica put`).

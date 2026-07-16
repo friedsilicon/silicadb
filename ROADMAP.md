@@ -35,7 +35,7 @@ semantic layer (`sodl-1` spec): fixed-layout `EntityNode`/`RelationEdge`
 storage, interned predicate ids, f32 edge weights, vector search, and the
 decay/aggregation/masking experiments. The phases below close that gap.
 
-## Phase 1 — weighted, interned edges (foundations)
+## Phase 1 — weighted, interned edges (foundations) — SHIPPED (D-009)
 
 Goal: links become measurable without breaking a byte on the wire or on disk.
 
@@ -51,7 +51,7 @@ Goal: links become measurable without breaking a byte on the wire or on disk.
 
 Exit: tests + smoke green, new tag in SPEC.md, decision logged (D-008).
 
-## Phase 2 — graph node layer (sodl kernel)
+## Phase 2 — graph node layer (sodl kernel) — SHIPPED (D-010)
 
 Goal: sodl's `EntityNode`/`RelationEdge` layouts as a **derived index**; the
 log stays canonical (D-004).
@@ -70,9 +70,9 @@ log stays canonical (D-004).
 Exit: graph traversal with no per-query allocation storm; `silica load`
 input format specified in SPEC.md.
 
-## Phase 3 — semantic experiments
+## Phase 3 — semantic experiments — SHIPPED (D-011)
 
-Each of these needs a decision before it is built (see open questions):
+Built read-time and stateless (decisions recorded in D-011):
 
 - **Temporal weight decay** applied at traversal time — needs a half-life.
 - **Hierarchical aggregation** of dense sub-graphs into pseudo-nodes during
@@ -95,11 +95,13 @@ Harvested from the abandoned RFC-0001 draft (D-008), not yet phased:
 
 ## Open questions
 
-1. sodl spec sections 1–3 and the compiler's output format — prerequisite
-   for the `silica load` format (`routes.sodl` on `spec-v0` shows store/policy
-   syntax, but not the extraction output).
-2. Embedding source for the vector layer — the daemon does not embed; what
-   does?
-3. Arena persistence: derived in-memory (recommended, consistent with D-004)
-   vs the spec's literal on-disk mmap file. Revisit only when
-   rebuild-on-replay time actually hurts.
+1. The sodl compiler itself: `silica load` (SPEC.md "Bulk load") is the
+   defined, normative contract it must emit — but the compiler that produces
+   those lines does not exist yet (`routes.sodl` on `spec-v0` shows store/
+   policy syntax, not extraction output).
+2. ~~Embedding source~~ — answered in D-011: caller-supplied (`put -V` /
+   VEC tag); the daemon never embeds.
+3. ~~Arena persistence~~ — answered in D-010: derived in-memory, rebuilt on
+   replay. Revisit only when rebuild-on-replay time actually hurts.
+4. HNSW: brute-force cosine until a measured workload says otherwise
+   (`vector_offset` stays reserved for it).

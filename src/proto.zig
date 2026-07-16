@@ -18,6 +18,7 @@ pub const OP_LIST: u8 = 0x13;
 pub const OP_LINK: u8 = 0x20;
 pub const OP_LINKS: u8 = 0x21;
 pub const OP_STATS: u8 = 0x30;
+pub const OP_SIM: u8 = 0x31;
 
 // frame flags
 pub const F_RESP: u8 = 0x80;
@@ -48,6 +49,14 @@ pub const T_MSG: u16 = 14;
 pub const T_WEIGHT: u16 = 15;
 pub const T_SRC: u16 = 16;
 pub const T_ASOF: u16 = 17;
+pub const T_HALFLIFE: u16 = 18;
+pub const T_ROLLUP: u16 = 19;
+pub const T_COUNT: u16 = 20;
+pub const T_VEC: u16 = 21;
+pub const T_LIMIT: u16 = 22;
+
+pub const VEC_DIM_MAX: usize = 4096;
+pub const SIM_LIMIT_MAX: u32 = 100;
 
 // record kinds
 pub const K_NOTE: u8 = 0;
