@@ -58,6 +58,12 @@ pub fn tlvU64(b: *std.ArrayList(u8), gpa: Allocator, tag: u16, v: u64) Allocator
     try tlv(b, gpa, tag, &t);
 }
 
+pub fn tlvF32(b: *std.ArrayList(u8), gpa: Allocator, tag: u16, v: f32) Allocator.Error!void {
+    var t: [4]u8 = undefined;
+    std.mem.writeInt(u32, &t, @bitCast(v), .little);
+    try tlv(b, gpa, tag, &t);
+}
+
 // ---- TLV decode ----
 
 pub const Tlv = struct { tag: u16, val: []const u8 };
@@ -104,6 +110,15 @@ pub fn findU64(pl: []const u8, tag: u16) error{Malformed}!?u64 {
     const v = (try find(pl, tag)) orelse return null;
     if (v.len != 8) return error.Malformed;
     return std.mem.readInt(u64, v[0..8], .little);
+}
+
+/// f32 value: must be finite (weights reject NaN/inf at the wire).
+pub fn findF32(pl: []const u8, tag: u16) error{Malformed}!?f32 {
+    const v = (try find(pl, tag)) orelse return null;
+    if (v.len != 4) return error.Malformed;
+    const f: f32 = @bitCast(std.mem.readInt(u32, v[0..4], .little));
+    if (!std.math.isFinite(f)) return error.Malformed;
+    return f;
 }
 
 // ---- fd i/o ----

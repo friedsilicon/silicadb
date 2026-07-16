@@ -64,8 +64,8 @@ Unknown tags are skipped — forward compatible by construction.
 | 0x11 | GET   | KEY                                | KEY, KIND, TAGS, TS, BODY (stored)  |
 | 0x12 | DEL   | KEY                                | —                                   |
 | 0x13 | LIST  | [PREFIX]                           | (KEY, KIND, TS)*                    |
-| 0x20 | LINK  | SUBJ, PRED, OBJ                    | —                                   |
-| 0x21 | LINKS | [KEY]                              | (SUBJ, PRED, OBJ, TS)*              |
+| 0x20 | LINK  | SUBJ, PRED, OBJ, [WEIGHT], [SRC]   | —                                   |
+| 0x21 | LINKS | [KEY]                              | (SUBJ, PRED, OBJ, WEIGHT, [SRC], TS)* |
 | 0x30 | STATS | —                                  | NKEYS, NLINKS, BYTES                |
 
 Status codes: `0 OK, 1 NOTFOUND, 2 BADREQ, 3 IO, 4 VERSION, 5 TOOBIG`.
@@ -88,6 +88,8 @@ Status codes: `0 OK, 1 NOTFOUND, 2 BADREQ, 3 IO, 4 VERSION, 5 TOOBIG`.
 | 12  | NLINKS  | u64  |                                        |
 | 13  | BYTES   | u64  | log size on disk                       |
 | 14  | MSG     | utf8 | optional error text on responses       |
+| 15  | WEIGHT  | f32  | link weight, IEEE 754 le; must be finite; default 1.0 |
+| 16  | SRC     | utf8 | provenance (session/agent/url), ≤255 bytes |
 
 If a PUT arrives without TS the server appends one; otherwise the client
 payload is stored verbatim — and returned verbatim on GET.
@@ -114,9 +116,10 @@ the log doubles as full history until then.
 
 - **Record**: key + kind + tags + timestamp + opaque body. Keys are
   namespaced by convention: `projectname/topic`, `user/prefs/editor`, …
-- **Link**: `(subject, predicate, object)` triple with timestamp; last write
-  wins per triple. Predicates are free-form today (`refines`, `depends-on`,
-  `derived-from`) — this is the ontology seed.
+- **Link**: `(subject, predicate, object)` triple with weight (f32, default
+  1.0), optional provenance, and timestamp; last write per triple wins and
+  updates weight/src/ts. Predicates are free-form strings on the wire and in
+  the log, interned to dense u16 ids in memory (derived, rebuilt on replay).
 
 ## Roadmap
 
