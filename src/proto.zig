@@ -6,6 +6,7 @@ pub const MAX_PAYLOAD: u32 = 16 * 1024 * 1024;
 
 pub const KEY_MAX: usize = 255;
 pub const TAGS_MAX: usize = 1024;
+pub const SRC_MAX: usize = 255;
 
 // opcodes
 pub const OP_HELLO: u8 = 0x01;
@@ -44,6 +45,8 @@ pub const T_NKEYS: u16 = 11;
 pub const T_NLINKS: u16 = 12;
 pub const T_BYTES: u16 = 13;
 pub const T_MSG: u16 = 14;
+pub const T_WEIGHT: u16 = 15;
+pub const T_SRC: u16 = 16;
 
 // record kinds
 pub const K_NOTE: u8 = 0;

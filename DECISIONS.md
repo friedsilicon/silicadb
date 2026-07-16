@@ -106,3 +106,21 @@ in SPEC.md when phase 2 starts.
 for unbuilt phases repeats the mistake that orphaned it; violates principles
 4 and 6); merging it under `rfc/` as a reference document (dead weight beside
 the living SPEC.md — the branch archive suffices).
+
+## D-009 2026-07-15 Weighted, interned, provenance-carrying links (phase 1)
+
+**Context:** ROADMAP.md phase 1. Links were unweighted string triples deduped
+by an O(n) scan over every link on every insert.
+
+**Decision:** New TLV tags WEIGHT (15, f32 le, must be finite, default 1.0)
+and SRC (16, utf8 ≤255). LINK accepts both; LINKS returns them. The log
+payload keeps predicate strings (log stays self-describing); in memory,
+predicates intern to dense u16 ids and inserts dedup via a per-subject
+adjacency map — both derived, rebuilt on replay. Old logs and old clients
+keep working (unknown tags skipped, absent weight reads as 1.0).
+
+**Rejected:** Predicate ids on disk (log would need an id table to stay
+portable, violating "the log is the artifact"); weight as fixed-point u32
+(f32 is what the sodl layer computes with; NaN/inf rejected at the wire);
+global triple hash for dedup (per-subject buckets are what phase-2 traversal
+needs anyway).

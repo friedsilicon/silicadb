@@ -16,7 +16,7 @@ const R_DEL: u8 = 2;
 const R_LINK: u8 = 3;
 
 pub const Slot = struct { off: u64, len: u32, kind: u8, ts: u64 };
-pub const Link = struct { s: []u8, p: []u8, o: []u8, ts: u64 };
+pub const Link = struct { s: []u8, pid: u16, o: []u8, ts: u64, w: f32, src: []u8 };
 
 pub const Store = struct {
     gpa: Allocator,
@@ -24,6 +24,10 @@ pub const Store = struct {
     end: u64,
     idx: std.StringHashMapUnmanaged(Slot) = .empty,
     links: std.ArrayList(Link) = .empty,
+    // derived, rebuilt on replay: predicate intern table + per-subject adjacency
+    preds: std.ArrayList([]u8) = .empty,
+    pred_ids: std.StringHashMapUnmanaged(u16) = .empty,
+    adj: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty,
 
     pub const Error = error{ Io, BadPayload, OutOfMemory };
 
@@ -90,10 +94,19 @@ pub const Store = struct {
         st.idx.deinit(st.gpa);
         for (st.links.items) |l| {
             st.gpa.free(l.s);
-            st.gpa.free(l.p);
             st.gpa.free(l.o);
+            st.gpa.free(l.src);
         }
         st.links.deinit(st.gpa);
+        for (st.preds.items) |p| st.gpa.free(p);
+        st.preds.deinit(st.gpa);
+        st.pred_ids.deinit(st.gpa);
+        var ait = st.adj.iterator();
+        while (ait.next()) |e| {
+            st.gpa.free(e.key_ptr.*);
+            e.value_ptr.deinit(st.gpa);
+        }
+        st.adj.deinit(st.gpa);
         _ = c.close(st.fd);
     }
 
@@ -128,15 +141,25 @@ pub const Store = struct {
         return true;
     }
 
-    pub fn link(st: *Store, s: []const u8, p: []const u8, o: []const u8, ts: u64) Error!void {
+    pub fn link(st: *Store, s: []const u8, p: []const u8, o: []const u8, w: f32, src: []const u8, ts: u64) Error!void {
         var b: std.ArrayList(u8) = .empty;
         defer b.deinit(st.gpa);
         try wire.tlv(&b, st.gpa, proto.T_SUBJ, s);
         try wire.tlv(&b, st.gpa, proto.T_PRED, p);
         try wire.tlv(&b, st.gpa, proto.T_OBJ, o);
+        try wire.tlvF32(&b, st.gpa, proto.T_WEIGHT, w);
+        if (src.len > 0) try wire.tlv(&b, st.gpa, proto.T_SRC, src);
         try wire.tlvU64(&b, st.gpa, proto.T_TS, ts);
         _ = try st.append(R_LINK, b.items);
-        try st.linksAdd(s, p, o, ts);
+        try st.linksAdd(s, p, o, ts, w, src);
+    }
+
+    pub fn predName(st: *const Store, pid: u16) []const u8 {
+        return st.preds.items[pid];
+    }
+
+    pub fn npreds(st: *Store) u64 {
+        return st.preds.items.len;
     }
 
     pub fn nkeys(st: *Store) u64 {
@@ -178,20 +201,54 @@ pub const Store = struct {
         try st.idx.put(st.gpa, k, slot);
     }
 
-    fn linksAdd(st: *Store, s: []const u8, p: []const u8, o: []const u8, ts: u64) Error!void {
-        for (st.links.items) |*l| {
-            if (std.mem.eql(u8, l.s, s) and std.mem.eql(u8, l.p, p) and std.mem.eql(u8, l.o, o)) {
-                l.ts = ts;
-                return;
+    fn predIntern(st: *Store, name: []const u8) Error!u16 {
+        if (st.pred_ids.get(name)) |id| return id;
+        if (st.preds.items.len > std.math.maxInt(u16)) return error.BadPayload;
+        const d = try st.gpa.dupe(u8, name);
+        errdefer st.gpa.free(d);
+        const id: u16 = @intCast(st.preds.items.len);
+        try st.preds.append(st.gpa, d);
+        errdefer _ = st.preds.pop();
+        try st.pred_ids.put(st.gpa, d, id);
+        return id;
+    }
+
+    /// Dedup key is (subject, predicate, object); a repeat updates ts/w/src.
+    fn linksAdd(st: *Store, s: []const u8, p: []const u8, o: []const u8, ts: u64, w: f32, src: []const u8) Error!void {
+        const pid = try st.predIntern(p);
+        if (st.adj.getPtr(s)) |bucket| {
+            for (bucket.items) |li| {
+                const l = &st.links.items[li];
+                if (l.pid == pid and std.mem.eql(u8, l.o, o)) {
+                    if (!std.mem.eql(u8, l.src, src)) {
+                        const dsrc = try st.gpa.dupe(u8, src);
+                        st.gpa.free(l.src);
+                        l.src = dsrc;
+                    }
+                    l.ts = ts;
+                    l.w = w;
+                    return;
+                }
             }
         }
         const ds = try st.gpa.dupe(u8, s);
         errdefer st.gpa.free(ds);
-        const dp = try st.gpa.dupe(u8, p);
-        errdefer st.gpa.free(dp);
         const dobj = try st.gpa.dupe(u8, o);
         errdefer st.gpa.free(dobj);
-        try st.links.append(st.gpa, .{ .s = ds, .p = dp, .o = dobj, .ts = ts });
+        const dsrc = try st.gpa.dupe(u8, src);
+        errdefer st.gpa.free(dsrc);
+        const li: u32 = @intCast(st.links.items.len);
+        try st.links.append(st.gpa, .{ .s = ds, .pid = pid, .o = dobj, .ts = ts, .w = w, .src = dsrc });
+        errdefer _ = st.links.pop();
+        const gop = try st.adj.getOrPut(st.gpa, s);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+            gop.key_ptr.* = st.gpa.dupe(u8, s) catch |e| {
+                st.adj.removeByPtr(gop.key_ptr);
+                return e;
+            };
+        }
+        try gop.value_ptr.append(st.gpa, li);
     }
 
     fn apply(st: *Store, rtype: u8, pl: []const u8, off: u64) Error!void {
@@ -217,7 +274,9 @@ pub const Store = struct {
                 const o = (wire.findStr(pl, proto.T_OBJ, proto.KEY_MAX) catch return error.BadPayload) orelse
                     return error.BadPayload;
                 const ts = (wire.findU64(pl, proto.T_TS) catch return error.BadPayload) orelse 0;
-                try st.linksAdd(s, p, o, ts);
+                const w = (wire.findF32(pl, proto.T_WEIGHT) catch return error.BadPayload) orelse 1.0;
+                const src = (wire.findStr(pl, proto.T_SRC, proto.SRC_MAX) catch return error.BadPayload) orelse "";
+                try st.linksAdd(s, p, o, ts, w, src);
             },
             else => return error.BadPayload,
         }

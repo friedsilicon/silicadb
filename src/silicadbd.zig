@@ -151,7 +151,15 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                     status = proto.ST_BADREQ;
                     break :blk;
                 }
-                g_st.link(s, p, o, wire.nowNs()) catch |e| {
+                const w = (wire.findF32(pl, proto.T_WEIGHT) catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                }) orelse 1.0;
+                const src = (wire.findStr(pl, proto.T_SRC, proto.SRC_MAX) catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                }) orelse "";
+                g_st.link(s, p, o, w, src, wire.nowNs()) catch |e| {
                     status = stFromErr(e);
                 };
             },
@@ -165,8 +173,10 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                         if (!std.mem.eql(u8, l.s, k) and !std.mem.eql(u8, l.o, k)) continue;
                     }
                     wire.tlv(&r, gpa, proto.T_SUBJ, l.s) catch break;
-                    wire.tlv(&r, gpa, proto.T_PRED, l.p) catch break;
+                    wire.tlv(&r, gpa, proto.T_PRED, g_st.predName(l.pid)) catch break;
                     wire.tlv(&r, gpa, proto.T_OBJ, l.o) catch break;
+                    wire.tlvF32(&r, gpa, proto.T_WEIGHT, l.w) catch break;
+                    if (l.src.len > 0) wire.tlv(&r, gpa, proto.T_SRC, l.src) catch break;
                     wire.tlvU64(&r, gpa, proto.T_TS, l.ts) catch break;
                 }
             },

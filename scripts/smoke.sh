@@ -36,8 +36,11 @@ test "$("$BIN"/silica get proj/other)" = "second value"
 "$BIN"/silica ls proj/ | grep -q greeting
 "$BIN"/silica link proj/greeting refines proj/other
 "$BIN"/silica links proj/greeting | grep -q refines
+"$BIN"/silica link proj/greeting cites proj/other -w 0.5 -s smoke
+"$BIN"/silica links proj/greeting | grep cites | grep -q 'w=0.50'
+"$BIN"/silica links proj/greeting | grep cites | grep -q 'src=smoke'
 "$BIN"/silica stats | grep -q '^keys: 2$'
-"$BIN"/silica stats | grep -q '^links: 1$'
+"$BIN"/silica stats | grep -q '^links: 2$'
 
 "$BIN"/silica rm proj/greeting
 if "$BIN"/silica get proj/greeting 2>/dev/null; then
@@ -52,6 +55,7 @@ start_daemon
 
 test "$("$BIN"/silica get proj/other)" = "second value"
 "$BIN"/silica links proj/greeting | grep -q refines
+"$BIN"/silica links proj/greeting | grep cites | grep -q 'w=0.50'
 "$BIN"/silica stats | grep -q '^keys: 1$'
 
 echo "SMOKE OK"

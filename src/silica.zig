@@ -46,11 +46,13 @@ fn usage() noreturn {
         \\usage: silica <command> [args]
         \\
         \\  ping                                  round-trip check
-        \\  put <key> [-k kind] [-t tags] [body]  store record (no body: read stdin)
+        \\  put <key> [-k kind] [-t tags] [-s src] [body]
+        \\                                        store record (no body: read stdin)
         \\  get <key> [-v]                        print body (-v: meta to stderr)
         \\  rm <key>                              delete record
         \\  ls [prefix]                           list keys
-        \\  link <subj> <pred> <obj>              add semantic triple
+        \\  link <subj> <pred> <obj> [-w weight] [-s src]
+        \\                                        add semantic triple (weight: f32, default 1)
         \\  links [key]                           list triples (touching key)
         \\  stats                                 store statistics
         \\
@@ -176,6 +178,7 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
     const key = args[0];
     var kind: u8 = proto.K_NOTE;
     var tags: ?[]const u8 = null;
+    var src: ?[]const u8 = null;
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(gpa);
     var have_words = false;
@@ -188,6 +191,9 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
         } else if (std.mem.eql(u8, args[i], "-t") and i + 1 < args.len) {
             i += 1;
             tags = args[i];
+        } else if (std.mem.eql(u8, args[i], "-s") and i + 1 < args.len) {
+            i += 1;
+            src = args[i];
         } else {
             if (have_words) body.append(gpa, ' ') catch die("oom", .{});
             body.appendSlice(gpa, args[i]) catch die("oom", .{});
@@ -200,6 +206,7 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
     wire.tlv(&req, gpa, proto.T_KEY, key) catch die("oom", .{});
     wire.tlvU8(&req, gpa, proto.T_KIND, kind) catch die("oom", .{});
     if (tags) |t| wire.tlv(&req, gpa, proto.T_TAGS, t) catch die("oom", .{});
+    if (src) |s| wire.tlv(&req, gpa, proto.T_SRC, s) catch die("oom", .{});
     wire.tlvU64(&req, gpa, proto.T_TS, wire.nowNs()) catch die("oom", .{});
     if (have_words) {
         wire.tlv(&req, gpa, proto.T_BODY, body.items) catch die("oom", .{});
@@ -302,12 +309,32 @@ fn cmdLs(fd: c.fd_t, args: []const []const u8) u8 {
 }
 
 fn cmdLink(fd: c.fd_t, args: []const []const u8) u8 {
-    if (args.len != 3) usage();
+    var pos: [3][]const u8 = undefined;
+    var npos: usize = 0;
+    var weight: f32 = 1.0;
+    var src: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-w") and i + 1 < args.len) {
+            i += 1;
+            weight = std.fmt.parseFloat(f32, args[i]) catch die("bad weight: {s}", .{args[i]});
+            if (!std.math.isFinite(weight)) die("bad weight: {s}", .{args[i]});
+        } else if (std.mem.eql(u8, args[i], "-s") and i + 1 < args.len) {
+            i += 1;
+            src = args[i];
+        } else if (npos < 3) {
+            pos[npos] = args[i];
+            npos += 1;
+        } else usage();
+    }
+    if (npos != 3) usage();
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(gpa);
-    wire.tlv(&req, gpa, proto.T_SUBJ, args[0]) catch die("oom", .{});
-    wire.tlv(&req, gpa, proto.T_PRED, args[1]) catch die("oom", .{});
-    wire.tlv(&req, gpa, proto.T_OBJ, args[2]) catch die("oom", .{});
+    wire.tlv(&req, gpa, proto.T_SUBJ, pos[0]) catch die("oom", .{});
+    wire.tlv(&req, gpa, proto.T_PRED, pos[1]) catch die("oom", .{});
+    wire.tlv(&req, gpa, proto.T_OBJ, pos[2]) catch die("oom", .{});
+    wire.tlvF32(&req, gpa, proto.T_WEIGHT, weight) catch die("oom", .{});
+    if (src) |s| wire.tlv(&req, gpa, proto.T_SRC, s) catch die("oom", .{});
     const r = call(fd, proto.OP_LINK, req.items);
     gpa.free(r.pl);
     if (r.st != proto.ST_OK) die("link: {s}", .{stStr(r.st)});
@@ -327,6 +354,8 @@ fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
     var s: []const u8 = "";
     var p: []const u8 = "";
     var o: []const u8 = "";
+    var w: f32 = 1.0;
+    var src: []const u8 = "";
     while (cur.next() catch die("bad response", .{})) |t| {
         if (t.tag == proto.T_SUBJ) {
             s = t.val;
@@ -334,10 +363,20 @@ fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
             p = t.val;
         } else if (t.tag == proto.T_OBJ) {
             o = t.val;
+        } else if (t.tag == proto.T_WEIGHT and t.val.len == 4) {
+            w = @bitCast(std.mem.readInt(u32, t.val[0..4], .little));
+        } else if (t.tag == proto.T_SRC) {
+            src = t.val;
         } else if (t.tag == proto.T_TS and t.val.len == 8) {
             var tb: [32]u8 = undefined;
             const ts = std.mem.readInt(u64, t.val[0..8], .little);
-            outPrint("{s} -[{s}]-> {s}  ({s})\n", .{ s, p, o, fmtTs(ts, &tb) });
+            if (src.len > 0) {
+                outPrint("{s} -[{s}]-> {s}  w={d:.2}  src={s}  ({s})\n", .{ s, p, o, w, src, fmtTs(ts, &tb) });
+            } else {
+                outPrint("{s} -[{s}]-> {s}  w={d:.2}  ({s})\n", .{ s, p, o, w, fmtTs(ts, &tb) });
+            }
+            w = 1.0;
+            src = "";
         }
     }
     return 0;
