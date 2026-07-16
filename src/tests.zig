@@ -4,7 +4,9 @@
 const std = @import("std");
 const proto = @import("proto.zig");
 const wire = @import("wire.zig");
-const Store = @import("store.zig").Store;
+const load = @import("load.zig");
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
 
 const t = std.testing;
 
@@ -95,8 +97,8 @@ test "store put/get/del/link and replay across reopen" {
         try t.expectEqualStrings("first", (try wire.find(got, proto.T_BODY)).?);
 
         try t.expectEqual(@as(?[]u8, null), try st.get(gpa, "missing"));
-        try t.expect(try st.del("a/one"));
-        try t.expect(!try st.del("a/one"));
+        try t.expect(try st.del("a/one", wire.nowNs()));
+        try t.expect(!try st.del("a/one", wire.nowNs()));
         try t.expectEqual(@as(u64, 1), st.nkeys());
         try t.expectEqual(@as(u64, 1), st.nlinks());
     }
@@ -156,6 +158,125 @@ test "link weight/src persist, dedup updates in place, predicates intern" {
         try t.expectEqualStrings("session-2", l.src);
         try t.expectEqual(@as(usize, 3), st.adj.get("a").?.items.len);
     }
+}
+
+fn putKeyTs(st: *Store, gpa: std.mem.Allocator, key: []const u8, body: []const u8, ts: u64) !void {
+    var pl: std.ArrayList(u8) = .empty;
+    defer pl.deinit(gpa);
+    try wire.tlv(&pl, gpa, proto.T_KEY, key);
+    try wire.tlvU8(&pl, gpa, proto.T_KIND, proto.K_NOTE);
+    try wire.tlvU64(&pl, gpa, proto.T_TS, ts);
+    try wire.tlv(&pl, gpa, proto.T_BODY, body);
+    try st.put(pl.items);
+}
+
+test "graph kernel: nodes and edge chains derive from puts/links and replay" {
+    const gpa = std.heap.c_allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var logbuf: [512]u8 = undefined;
+    const logp = try std.fmt.bufPrintZ(&logbuf, ".zig-cache/tmp/{s}/memory.log", .{tmp.sub_path});
+
+    {
+        var st = try Store.open(gpa, logp);
+        defer st.close();
+        try putKey(&st, gpa, "n/a", "alpha");
+        try st.link("n/a", "refines", "n/b", 0.5, "", 100); // n/b: link-only node
+        try st.link("n/a", "cites", "n/b", 0.7, "", 200);
+        try st.link("n/b", "refines", "n/a", 1.0, "", 300);
+
+        try t.expectEqual(@as(u64, 2), st.nnodes());
+        try t.expectEqual(@as(u64, 3), st.nedges());
+
+        const ai = st.node_by_hash.get(store_mod.idHash("n/a")).?;
+        const bi = st.node_by_hash.get(store_mod.idHash("n/b")).?;
+        const a = st.nodes.items[ai];
+        const b = st.nodes.items[bi];
+        try t.expectEqual(@as(u32, 2), a.edge_count);
+        try t.expectEqual(@as(u32, 1), b.edge_count);
+        try t.expectEqual(proto.K_NOTE, a.category_enum); // put sets category
+        try t.expectEqual(@as(u8, 0xff), b.category_enum); // link-only endpoint
+        try t.expectEqual(@as(u16, 3), a.name_len);
+
+        // edge dedup mirrors link dedup: re-link updates weight in the chain
+        try st.link("n/a", "refines", "n/b", 0.9, "", 400);
+        try t.expectEqual(@as(u64, 3), st.nedges());
+        var ei = st.nodes.items[ai].edge_head;
+        var saw = false;
+        while (ei != store_mod.NONE) {
+            const e = st.edges.items[ei];
+            if (std.mem.eql(u8, st.predName(e.pid), "refines") and e.target == bi) {
+                try t.expectEqual(@as(f32, 0.9), e.w);
+                saw = true;
+            }
+            ei = e.next;
+        }
+        try t.expect(saw);
+    }
+
+    // kernel is derived: replay must rebuild it identically
+    {
+        var st = try Store.open(gpa, logp);
+        defer st.close();
+        try t.expectEqual(@as(u64, 2), st.nnodes());
+        try t.expectEqual(@as(u64, 3), st.nedges());
+        const ai = st.node_by_hash.get(store_mod.idHash("n/a")).?;
+        try t.expectEqual(@as(u32, 2), st.nodes.items[ai].edge_count);
+    }
+}
+
+test "getAsOf: point-in-time reads across put/overwrite/del" {
+    const gpa = std.heap.c_allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var logbuf: [512]u8 = undefined;
+    const logp = try std.fmt.bufPrintZ(&logbuf, ".zig-cache/tmp/{s}/memory.log", .{tmp.sub_path});
+
+    var st = try Store.open(gpa, logp);
+    defer st.close();
+    try putKeyTs(&st, gpa, "k", "v1", 100);
+    try putKeyTs(&st, gpa, "k", "v2", 200);
+    try t.expect(try st.del("k", 300));
+
+    try t.expectEqual(@as(?[]u8, null), try st.getAsOf(gpa, "k", 50)); // before birth
+    const at150 = (try st.getAsOf(gpa, "k", 150)).?;
+    defer gpa.free(at150);
+    try t.expectEqualStrings("v1", (try wire.find(at150, proto.T_BODY)).?);
+    const at250 = (try st.getAsOf(gpa, "k", 250)).?;
+    defer gpa.free(at250);
+    try t.expectEqualStrings("v2", (try wire.find(at250, proto.T_BODY)).?);
+    try t.expectEqual(@as(?[]u8, null), try st.getAsOf(gpa, "k", 350)); // after del
+    try t.expectEqual(@as(?[]u8, null), try st.getAsOf(gpa, "never", 999));
+}
+
+test "load line format parses and rejects per SPEC" {
+    // put: empty kind/tags/src default; body after 5th tab, may contain tabs
+    const p = (try load.parseLine("put\tproj/x\tfact\ta,b\tsess\thello\tworld")).?.put;
+    try t.expectEqualStrings("proj/x", p.key);
+    try t.expectEqual(proto.K_FACT, p.kind);
+    try t.expectEqualStrings("a,b", p.tags);
+    try t.expectEqualStrings("sess", p.src);
+    try t.expectEqualStrings("hello\tworld", p.body);
+    const pd = (try load.parseLine("put\tk\t\t\t\tbody")).?.put;
+    try t.expectEqual(proto.K_NOTE, pd.kind);
+
+    // link: weight/src optional
+    const l = (try load.parseLine("link\ta\trefines\tb\t0.25\tsess")).?.link;
+    try t.expectEqual(@as(f32, 0.25), l.w);
+    try t.expectEqualStrings("sess", l.src);
+    const ld = (try load.parseLine("link\ta\trefines\tb")).?.link;
+    try t.expectEqual(@as(f32, 1.0), ld.w);
+
+    // skip blanks and comments
+    try t.expectEqual(@as(?load.Line, null), try load.parseLine(""));
+    try t.expectEqual(@as(?load.Line, null), try load.parseLine("# comment"));
+
+    // rejects
+    try t.expectError(error.Malformed, load.parseLine("nope\ta\tb"));
+    try t.expectError(error.Malformed, load.parseLine("put\t\tfact\t\t\tbody")); // empty key
+    try t.expectError(error.Malformed, load.parseLine("link\ta\tb")); // missing obj
+    try t.expectError(error.Malformed, load.parseLine("link\ta\tp\tb\tNaN\t"));
+    try t.expectError(error.Malformed, load.parseLine("link\ta\tp\tb\t1.0\ts\textra"));
 }
 
 test "store rejects put without key" {

@@ -124,3 +124,26 @@ portable, violating "the log is the artifact"); weight as fixed-point u32
 (f32 is what the sodl layer computes with; NaN/inf rejected at the wire);
 global triple hash for dedup (per-subject buckets are what phase-2 traversal
 needs anyway).
+
+## D-010 2026-07-15 Graph kernel as derived index; as-of reads; bulk load (phase 2)
+
+**Context:** ROADMAP.md phase 2 — the sodl EntityNode/RelationEdge layout,
+point-in-time reads, and the compiler↔db ingest contract.
+
+**Decision:** The graph kernel (EntityNode table keyed by wyhash-64 of the
+key, RelationEdge arena with per-subject intrusive chains) is a **derived
+index**: maintained on mutation, rebuilt from the log on replay, never
+serialized. Edges store the target *node index* (u32), not the sodl spec's
+u64 id_hash — the hash is one lookup away and the arena stays half the size.
+GET gains ASOF (tag 17): a linear log rescan answering "value at instant T";
+DEL records now carry TS to support it (old TS-less DELs inherit the previous
+record's ts — sound because the log appends in time order). LINKS accepts
+repeated PRED tags filtered via a u64 bitmask over interned ids (< 64) with a
+small-list fallback. `silica load` TSV is specified normatively in SPEC.md —
+it is the one interface an external program (sodl compiler) must emit.
+
+**Rejected:** On-disk mmap arena (nothing measured demands persistence of a
+rebuildable index; revisit when replay time hurts — ROADMAP open question 3);
+as-of via per-key version chains in memory (state grows with history; the log
+already is the history); id_hash as edge target (u64 vs u32, no read either
+way); JSON/CSV load formats (tabs need no quoting layer for this data).

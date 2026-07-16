@@ -42,6 +42,25 @@ test "$("$BIN"/silica get proj/other)" = "second value"
 "$BIN"/silica stats | grep -q '^keys: 2$'
 "$BIN"/silica stats | grep -q '^links: 2$'
 
+# phase 2: predicate filter, bulk load, as-of reads
+"$BIN"/silica links proj/greeting -p cites | grep -q cites
+if "$BIN"/silica links proj/greeting -p refines | grep -q cites; then
+    echo "FAIL: predicate filter leaked"
+    exit 1
+fi
+
+printf 'put\tbulk/one\tfact\t\tloader\tbulk body one\nlink\tbulk/one\tcites\tproj/other\t0.25\tloader\n# comment\n' \
+    | "$BIN"/silica load | grep -q 'loaded 1 records, 1 links'
+test "$("$BIN"/silica get bulk/one)" = "bulk body one"
+"$BIN"/silica links bulk/one -p cites | grep -q 'w=0.25'
+
+sleep 1 # date +%s floors: keep prior puts strictly before T0
+T0=$(date +%s)
+sleep 1
+"$BIN"/silica put proj/other -k fact third value
+test "$("$BIN"/silica get proj/other)" = "third value"
+test "$("$BIN"/silica get proj/other -a "$T0")" = "second value"
+
 "$BIN"/silica rm proj/greeting
 if "$BIN"/silica get proj/greeting 2>/dev/null; then
     echo "FAIL: expected miss after rm"
@@ -53,9 +72,10 @@ kill "$PID"
 wait "$PID" 2>/dev/null || true
 start_daemon
 
-test "$("$BIN"/silica get proj/other)" = "second value"
+test "$("$BIN"/silica get proj/other)" = "third value"
+test "$("$BIN"/silica get proj/other -a "$T0")" = "second value"
 "$BIN"/silica links proj/greeting | grep -q refines
 "$BIN"/silica links proj/greeting | grep cites | grep -q 'w=0.50'
-"$BIN"/silica stats | grep -q '^keys: 1$'
+"$BIN"/silica stats | grep -q '^keys: 2$'
 
 echo "SMOKE OK"

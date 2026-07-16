@@ -47,6 +47,7 @@ pub const T_BYTES: u16 = 13;
 pub const T_MSG: u16 = 14;
 pub const T_WEIGHT: u16 = 15;
 pub const T_SRC: u16 = 16;
+pub const T_ASOF: u16 = 17;
 
 // record kinds
 pub const K_NOTE: u8 = 0;

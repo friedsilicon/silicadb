@@ -4,6 +4,7 @@ const std = @import("std");
 const c = std.c;
 const proto = @import("proto.zig");
 const wire = @import("wire.zig");
+const load = @import("load.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -48,12 +49,13 @@ fn usage() noreturn {
         \\  ping                                  round-trip check
         \\  put <key> [-k kind] [-t tags] [-s src] [body]
         \\                                        store record (no body: read stdin)
-        \\  get <key> [-v]                        print body (-v: meta to stderr)
+        \\  get <key> [-v] [-a ts]                print body (-v: meta; -a: as-of unix s|ns)
         \\  rm <key>                              delete record
         \\  ls [prefix]                           list keys
         \\  link <subj> <pred> <obj> [-w weight] [-s src]
         \\                                        add semantic triple (weight: f32, default 1)
-        \\  links [key]                           list triples (touching key)
+        \\  links [key] [-p pred[,pred]]          list triples (touching key; -p: filter)
+        \\  load                                  bulk ingest TSV lines from stdin (SPEC.md)
         \\  stats                                 store statistics
         \\
         \\kinds: note fact pref project ref (or 0-255)
@@ -80,18 +82,17 @@ fn stStr(st: u16) []const u8 {
     };
 }
 
-const kind_names = [_][]const u8{ "note", "fact", "pref", "project", "ref" };
-
-fn kindParse(s: []const u8) ?u8 {
-    for (kind_names, 0..) |n, i| {
-        if (std.mem.eql(u8, s, n)) return @intCast(i);
-    }
-    return std.fmt.parseInt(u8, s, 10) catch null;
-}
+const kindParse = load.kindParse;
 
 fn kindName(k: u8, buf: []u8) []const u8 {
-    if (k < kind_names.len) return kind_names[k];
+    if (k < load.kind_names.len) return load.kind_names[k];
     return std.fmt.bufPrint(buf, "{d}", .{k}) catch "?";
+}
+
+/// as-of argument: unix seconds or nanoseconds (values < 1e11 read as s).
+fn asofParse(s: []const u8) ?u64 {
+    const v = std.fmt.parseInt(u64, s, 10) catch return null;
+    return if (v < 100_000_000_000) v * 1_000_000_000 else v;
 }
 
 fn fmtTs(ns: u64, buf: []u8) []const u8 {
@@ -225,9 +226,15 @@ fn cmdPut(fd: c.fd_t, args: []const []const u8) u8 {
 fn cmdGet(fd: c.fd_t, args: []const []const u8) u8 {
     var key: ?[]const u8 = null;
     var verbose = false;
-    for (args) |a| {
+    var asof: ?u64 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
         if (std.mem.eql(u8, a, "-v")) {
             verbose = true;
+        } else if (std.mem.eql(u8, a, "-a") and i + 1 < args.len) {
+            i += 1;
+            asof = asofParse(args[i]) orelse die("bad as-of timestamp: {s}", .{args[i]});
         } else if (key == null) {
             key = a;
         } else usage();
@@ -237,6 +244,7 @@ fn cmdGet(fd: c.fd_t, args: []const []const u8) u8 {
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(gpa);
     wire.tlv(&req, gpa, proto.T_KEY, k) catch die("oom", .{});
+    if (asof) |ts| wire.tlvU64(&req, gpa, proto.T_ASOF, ts) catch die("oom", .{});
     const r = call(fd, proto.OP_GET, req.items);
     defer gpa.free(r.pl);
     if (r.st == proto.ST_NOTFOUND) {
@@ -342,10 +350,26 @@ fn cmdLink(fd: c.fd_t, args: []const []const u8) u8 {
 }
 
 fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
-    if (args.len > 1) usage();
+    var key: ?[]const u8 = null;
+    var preds: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-p") and i + 1 < args.len) {
+            i += 1;
+            preds = args[i];
+        } else if (key == null) {
+            key = args[i];
+        } else usage();
+    }
     var req: std.ArrayList(u8) = .empty;
     defer req.deinit(gpa);
-    if (args.len == 1) wire.tlv(&req, gpa, proto.T_KEY, args[0]) catch die("oom", .{});
+    if (key) |k| wire.tlv(&req, gpa, proto.T_KEY, k) catch die("oom", .{});
+    if (preds) |ps| {
+        var it = std.mem.splitScalar(u8, ps, ',');
+        while (it.next()) |p| {
+            if (p.len > 0) wire.tlv(&req, gpa, proto.T_PRED, p) catch die("oom", .{});
+        }
+    }
     const r = call(fd, proto.OP_LINKS, req.items);
     defer gpa.free(r.pl);
     if (r.st != proto.ST_OK) die("links: {s}", .{stStr(r.st)});
@@ -379,6 +403,50 @@ fn cmdLinks(fd: c.fd_t, args: []const []const u8) u8 {
             src = "";
         }
     }
+    return 0;
+}
+
+fn cmdLoad(fd: c.fd_t, args: []const []const u8) u8 {
+    if (args.len != 0) usage();
+    const input = readStdin();
+    defer gpa.free(input);
+
+    var nputs: u64 = 0;
+    var nlinks: u64 = 0;
+    var lineno: u64 = 0;
+    var it = std.mem.splitScalar(u8, input, '\n');
+    while (it.next()) |raw| {
+        lineno += 1;
+        const parsed = (load.parseLine(raw) catch die("load: bad line {d}", .{lineno})) orelse continue;
+        var req: std.ArrayList(u8) = .empty;
+        defer req.deinit(gpa);
+        switch (parsed) {
+            .put => |p| {
+                wire.tlv(&req, gpa, proto.T_KEY, p.key) catch die("oom", .{});
+                wire.tlvU8(&req, gpa, proto.T_KIND, p.kind) catch die("oom", .{});
+                if (p.tags.len > 0) wire.tlv(&req, gpa, proto.T_TAGS, p.tags) catch die("oom", .{});
+                if (p.src.len > 0) wire.tlv(&req, gpa, proto.T_SRC, p.src) catch die("oom", .{});
+                wire.tlvU64(&req, gpa, proto.T_TS, wire.nowNs()) catch die("oom", .{});
+                wire.tlv(&req, gpa, proto.T_BODY, p.body) catch die("oom", .{});
+                const r = call(fd, proto.OP_PUT, req.items);
+                gpa.free(r.pl);
+                if (r.st != proto.ST_OK) die("load: line {d}: put {s}: {s}", .{ lineno, p.key, stStr(r.st) });
+                nputs += 1;
+            },
+            .link => |l| {
+                wire.tlv(&req, gpa, proto.T_SUBJ, l.s) catch die("oom", .{});
+                wire.tlv(&req, gpa, proto.T_PRED, l.p) catch die("oom", .{});
+                wire.tlv(&req, gpa, proto.T_OBJ, l.o) catch die("oom", .{});
+                wire.tlvF32(&req, gpa, proto.T_WEIGHT, l.w) catch die("oom", .{});
+                if (l.src.len > 0) wire.tlv(&req, gpa, proto.T_SRC, l.src) catch die("oom", .{});
+                const r = call(fd, proto.OP_LINK, req.items);
+                gpa.free(r.pl);
+                if (r.st != proto.ST_OK) die("load: line {d}: link: {s}", .{ lineno, stStr(r.st) });
+                nlinks += 1;
+            },
+        }
+    }
+    outPrint("loaded {d} records, {d} links\n", .{ nputs, nlinks });
     return 0;
 }
 
@@ -416,6 +484,7 @@ pub export fn main(argc: c_int, argv: [*][*:0]u8) c_int {
     if (std.mem.eql(u8, cmd, "ls")) return cmdLs(fd, rest);
     if (std.mem.eql(u8, cmd, "link")) return cmdLink(fd, rest);
     if (std.mem.eql(u8, cmd, "links")) return cmdLinks(fd, rest);
+    if (std.mem.eql(u8, cmd, "load")) return cmdLoad(fd, rest);
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(fd);
     usage();
 }
