@@ -61,6 +61,19 @@ sleep 1
 test "$("$BIN"/silica get proj/other)" = "third value"
 test "$("$BIN"/silica get proj/other -a "$T0")" = "second value"
 
+# phase 3: read-time decay, rollup, vector similarity
+"$BIN"/silica links proj/greeting -p cites -d 1 | grep cites | grep -qv 'w=0.50'
+"$BIN"/silica links proj/greeting -p cites | grep cites | grep -q 'w=0.50' # decay never mutates
+
+for n in 1 2 3 4; do "$BIN"/silica link hub member "leaf/$n"; done
+"$BIN"/silica links hub -r 4 | grep -q '(4 objects)'
+"$BIN"/silica links hub -r 5 | grep -q 'leaf/1'
+
+"$BIN"/silica put vec/a -k note -V 1,0 alpha
+"$BIN"/silica put vec/b -k note -V 0,1 beta
+"$BIN"/silica sim 1,0 -n 1 | grep -q vec/a
+"$BIN"/silica sim '0.1,0.9' -n 1 | grep -q vec/b
+
 "$BIN"/silica rm proj/greeting
 if "$BIN"/silica get proj/greeting 2>/dev/null; then
     echo "FAIL: expected miss after rm"
@@ -76,6 +89,7 @@ test "$("$BIN"/silica get proj/other)" = "third value"
 test "$("$BIN"/silica get proj/other -a "$T0")" = "second value"
 "$BIN"/silica links proj/greeting | grep -q refines
 "$BIN"/silica links proj/greeting | grep cites | grep -q 'w=0.50'
-"$BIN"/silica stats | grep -q '^keys: 2$'
+"$BIN"/silica sim 1,0 -n 1 | grep -q vec/a
+"$BIN"/silica stats | grep -q '^keys: 4$'
 
 echo "SMOKE OK"

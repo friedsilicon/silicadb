@@ -279,6 +279,84 @@ test "load line format parses and rejects per SPEC" {
     try t.expectError(error.Malformed, load.parseLine("link\ta\tp\tb\t1.0\ts\textra"));
 }
 
+test "decay halves at one half-life and is off at halflife 0" {
+    try t.expectEqual(@as(f32, 0.8), store_mod.decayed(0.8, 12345, 0));
+    try t.expectApproxEqAbs(@as(f32, 0.5), store_mod.decayed(1.0, 1000, 1000), 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 0.25), store_mod.decayed(1.0, 2000, 1000), 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 1.0), store_mod.decayed(1.0, 0, 1000), 1e-6);
+}
+
+test "cosine similarity: identity, orthogonal, mismatch, zero norm" {
+    const a = [_]f32{ 1, 0 };
+    const b = [_]f32{ 0, 1 };
+    const z = [_]f32{ 0, 0 };
+    const d3 = [_]f32{ 1, 0, 0 };
+    try t.expectApproxEqAbs(@as(f32, 1.0), store_mod.cosine(&a, &a).?, 1e-6);
+    try t.expectApproxEqAbs(@as(f32, 0.0), store_mod.cosine(&a, &b).?, 1e-6);
+    try t.expectEqual(@as(?f32, null), store_mod.cosine(&a, &d3));
+    try t.expectEqual(@as(?f32, null), store_mod.cosine(&a, &z));
+}
+
+fn putVec(st: *Store, gpa: std.mem.Allocator, key: []const u8, vec: []const f32) !void {
+    var vb: std.ArrayList(u8) = .empty;
+    defer vb.deinit(gpa);
+    for (vec) |f| {
+        var t4: [4]u8 = undefined;
+        std.mem.writeInt(u32, &t4, @bitCast(f), .little);
+        try vb.appendSlice(gpa, &t4);
+    }
+    var pl: std.ArrayList(u8) = .empty;
+    defer pl.deinit(gpa);
+    try wire.tlv(&pl, gpa, proto.T_KEY, key);
+    try wire.tlvU64(&pl, gpa, proto.T_TS, wire.nowNs());
+    try wire.tlv(&pl, gpa, proto.T_VEC, vb.items);
+    try wire.tlv(&pl, gpa, proto.T_BODY, "v");
+    try st.put(pl.items);
+}
+
+test "vectors: attach on put, replace, survive replay, drop on del" {
+    const gpa = std.heap.c_allocator;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var logbuf: [512]u8 = undefined;
+    const logp = try std.fmt.bufPrintZ(&logbuf, ".zig-cache/tmp/{s}/memory.log", .{tmp.sub_path});
+
+    {
+        var st = try Store.open(gpa, logp);
+        defer st.close();
+        try putVec(&st, gpa, "v/a", &.{ 1, 0 });
+        try putVec(&st, gpa, "v/b", &.{ 0, 1 });
+        try t.expectEqual(@as(u64, 2), st.nvecs());
+        try t.expectApproxEqAbs(@as(f32, 1.0), st.vecs.get("v/a").?[0], 1e-6);
+
+        // re-put replaces the vector
+        try putVec(&st, gpa, "v/a", &.{ 0.5, 0.5 });
+        try t.expectEqual(@as(u64, 2), st.nvecs());
+        try t.expectApproxEqAbs(@as(f32, 0.5), st.vecs.get("v/a").?[0], 1e-6);
+
+        // odd byte length is rejected before touching the log
+        var pl: std.ArrayList(u8) = .empty;
+        defer pl.deinit(gpa);
+        try wire.tlv(&pl, gpa, proto.T_KEY, "v/bad");
+        try wire.tlv(&pl, gpa, proto.T_VEC, "abc");
+        try t.expectError(error.BadPayload, st.put(pl.items));
+    }
+    {
+        var st = try Store.open(gpa, logp);
+        defer st.close();
+        try t.expectEqual(@as(u64, 2), st.nvecs());
+        try t.expectApproxEqAbs(@as(f32, 0.5), st.vecs.get("v/a").?[0], 1e-6);
+        try t.expect(try st.del("v/a", wire.nowNs()));
+        try t.expectEqual(@as(u64, 1), st.nvecs());
+    }
+    {
+        var st = try Store.open(gpa, logp);
+        defer st.close();
+        try t.expectEqual(@as(u64, 1), st.nvecs()); // del replays too
+        try t.expect(st.vecs.get("v/a") == null);
+    }
+}
+
 test "store rejects put without key" {
     const gpa = std.heap.c_allocator;
     var tmp = t.tmpDir(.{});

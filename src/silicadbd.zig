@@ -201,7 +201,21 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                         }
                     }
                 }
-                for (g_st.links.items) |l| {
+                const hl_opt = wire.findU64(pl, proto.T_HALFLIFE) catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                };
+                const halflife: u64 = hl_opt orelse 0; // 0 = no decay
+                const ru_opt = wire.findU8(pl, proto.T_ROLLUP) catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                };
+                const rollup: u8 = ru_opt orelse 0; // 0 = off; else min group size
+                const now = wire.nowNs();
+
+                var pass: std.ArrayListUnmanaged(u32) = .empty;
+                defer pass.deinit(gpa);
+                for (g_st.links.items, 0..) |l, li| {
                     if (key) |k| {
                         if (!std.mem.eql(u8, l.s, k) and !std.mem.eql(u8, l.o, k)) continue;
                     }
@@ -217,12 +231,108 @@ fn dispatch(conn: *Conn, op: u8, rid: u64, pl: []const u8) void {
                         }
                         if (!hit) continue;
                     }
+                    pass.append(gpa, @intCast(li)) catch {
+                        status = proto.ST_IO;
+                        break :blk;
+                    };
+                }
+
+                // rollup: group by (subject node, predicate); a group with
+                // >= threshold members collapses to one pseudo-row:
+                // OBJ "*", max effective weight, latest ts, COUNT.
+                const Group = struct { count: u32, wmax: f32, ts: u64, emitted: bool };
+                var groups: std.AutoHashMapUnmanaged(u64, Group) = .empty;
+                defer groups.deinit(gpa);
+                if (rollup > 0) for (pass.items) |li| {
+                    const l = g_st.links.items[li];
+                    const nidx = g_st.node_by_hash.get(store_mod.idHash(l.s)).?;
+                    const gk = (@as(u64, nidx) << 16) | l.pid;
+                    const ew = store_mod.decayed(l.w, now -| l.ts, halflife);
+                    const gop = groups.getOrPut(gpa, gk) catch {
+                        status = proto.ST_IO;
+                        break :blk;
+                    };
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = .{ .count = 1, .wmax = ew, .ts = l.ts, .emitted = false };
+                    } else {
+                        gop.value_ptr.count += 1;
+                        if (ew > gop.value_ptr.wmax) gop.value_ptr.wmax = ew;
+                        if (l.ts > gop.value_ptr.ts) gop.value_ptr.ts = l.ts;
+                    }
+                };
+
+                for (pass.items) |li| {
+                    const l = g_st.links.items[li];
+                    if (rollup > 0) {
+                        const nidx = g_st.node_by_hash.get(store_mod.idHash(l.s)).?;
+                        const g = groups.getPtr((@as(u64, nidx) << 16) | l.pid).?;
+                        if (g.count >= rollup) {
+                            if (!g.emitted) {
+                                g.emitted = true;
+                                wire.tlv(&r, gpa, proto.T_SUBJ, l.s) catch break;
+                                wire.tlv(&r, gpa, proto.T_PRED, g_st.predName(l.pid)) catch break;
+                                wire.tlv(&r, gpa, proto.T_OBJ, "*") catch break;
+                                wire.tlvF32(&r, gpa, proto.T_WEIGHT, g.wmax) catch break;
+                                wire.tlvU32(&r, gpa, proto.T_COUNT, g.count) catch break;
+                                wire.tlvU64(&r, gpa, proto.T_TS, g.ts) catch break;
+                            }
+                            continue;
+                        }
+                    }
                     wire.tlv(&r, gpa, proto.T_SUBJ, l.s) catch break;
                     wire.tlv(&r, gpa, proto.T_PRED, g_st.predName(l.pid)) catch break;
                     wire.tlv(&r, gpa, proto.T_OBJ, l.o) catch break;
-                    wire.tlvF32(&r, gpa, proto.T_WEIGHT, l.w) catch break;
+                    wire.tlvF32(&r, gpa, proto.T_WEIGHT, store_mod.decayed(l.w, now -| l.ts, halflife)) catch break;
                     if (l.src.len > 0) wire.tlv(&r, gpa, proto.T_SRC, l.src) catch break;
                     wire.tlvU64(&r, gpa, proto.T_TS, l.ts) catch break;
+                }
+            },
+            proto.OP_SIM => {
+                const qb = (wire.find(pl, proto.T_VEC) catch null) orelse {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                };
+                if (qb.len == 0 or qb.len % 4 != 0 or qb.len / 4 > proto.VEC_DIM_MAX) {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                }
+                const lim_opt = wire.findU32(pl, proto.T_LIMIT) catch {
+                    status = proto.ST_BADREQ;
+                    break :blk;
+                };
+                const limit: usize = @min(@as(usize, lim_opt orelse 10), @as(usize, proto.SIM_LIMIT_MAX));
+                const dim = qb.len / 4;
+                const q = gpa.alloc(f32, dim) catch {
+                    status = proto.ST_IO;
+                    break :blk;
+                };
+                defer gpa.free(q);
+                for (q, 0..) |*f, i| f.* = @bitCast(std.mem.readInt(u32, qb[i * 4 ..][0..4], .little));
+
+                // brute-force cosine, top-k by insertion (D-011: HNSW waits
+                // for a measured need)
+                var keys: [proto.SIM_LIMIT_MAX][]const u8 = undefined;
+                var scores: [proto.SIM_LIMIT_MAX]f32 = undefined;
+                var nres: usize = 0;
+                var it = g_st.vecs.iterator();
+                while (it.next()) |e| {
+                    const cs = store_mod.cosine(q, e.value_ptr.*) orelse continue;
+                    var pos = nres;
+                    while (pos > 0 and scores[pos - 1] < cs) : (pos -= 1) {}
+                    if (pos >= limit) continue;
+                    const end = @min(nres + 1, limit);
+                    var j = end;
+                    while (j > pos + 1) : (j -= 1) {
+                        keys[j - 1] = keys[j - 2];
+                        scores[j - 1] = scores[j - 2];
+                    }
+                    keys[pos] = e.key_ptr.*;
+                    scores[pos] = cs;
+                    nres = end;
+                }
+                for (keys[0..nres], scores[0..nres]) |k, sc| {
+                    wire.tlv(&r, gpa, proto.T_KEY, k) catch break;
+                    wire.tlvF32(&r, gpa, proto.T_WEIGHT, sc) catch break;
                 }
             },
             proto.OP_STATS => {

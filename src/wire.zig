@@ -106,6 +106,12 @@ pub fn findU8(pl: []const u8, tag: u16) error{Malformed}!?u8 {
     return v[0];
 }
 
+pub fn findU32(pl: []const u8, tag: u16) error{Malformed}!?u32 {
+    const v = (try find(pl, tag)) orelse return null;
+    if (v.len != 4) return error.Malformed;
+    return std.mem.readInt(u32, v[0..4], .little);
+}
+
 pub fn findU64(pl: []const u8, tag: u16) error{Malformed}!?u64 {
     const v = (try find(pl, tag)) orelse return null;
     if (v.len != 8) return error.Malformed;
